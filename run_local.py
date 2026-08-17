@@ -139,6 +139,15 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/api/upload":
             return self._handle_upload()
+        if parsed.path == "/api/thumb_batch":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                payload = json.loads(self.rfile.read(length) or b"{}")
+            except Exception as e:
+                return self._send(400, {"ok": False, "error": f"请求解析失败：{e}"})
+            d = payload.get("dir", "")
+            rels = payload.get("rels", [])
+            return self._send(200, libops.get_thumbs_batch(d, rels))
         if parsed.path == "/api/rename":
             try:
                 length = int(self.headers.get("Content-Length", 0))

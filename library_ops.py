@@ -353,6 +353,33 @@ def get_thumb(dir_path: str, rel: str) -> str:
         return ''
 
 
+def get_thumbs_batch(dir_path: str, rels) -> dict:
+    """批量缩略图：一次 Python 进程渲染多张，返回 {rel: b64}（命中缓存直接复用）。
+
+    性能质变：滚动加载一屏（~20 张）从「20 次子进程启动」降为「1 次」，
+    配合前端节流合并请求，根治曲库滚动卡顿与命令行窗口反复闪现。
+    """
+    dir_path = _norm_dir(dir_path)
+    if not dir_path or not os.path.isdir(dir_path):
+        return {}
+    cd = _cache_dir(dir_path)
+    out = {}
+    for rel in rels or []:
+        rel = _norm_dir(rel)
+        if not rel:
+            continue
+        full = os.path.join(dir_path, rel)
+        if not os.path.isfile(full):
+            continue
+        try:
+            b64 = render_thumb(full, cache_dir=cd)
+            if b64:
+                out[rel] = b64
+        except Exception:
+            continue
+    return out
+
+
 # ===================== 本地主题关键词检测 =====================
 def detect_theme(text: str) -> str:
     """从 PDF 首页文字里识别 动画/游戏/电影/影视/特摄 主题曲标签。"""
@@ -559,6 +586,11 @@ def main():
     th.add_argument('--dir', required=True)
     th.add_argument('--name', required=True)
 
+    tb = sub.add_parser('thumb_batch', help='批量缩略图 base64（一次进程多张）')
+    tb.add_argument('--dir', required=True)
+    tb.add_argument('--rels', required=True,
+                    help='JSON 数组：["rel1","rel2",...]')
+
     ins = sub.add_parser('inspect', help='扫描曲库并给出命名建议')
     ins.add_argument('--dir', required=True)
 
@@ -583,6 +615,9 @@ def main():
         elif args.action == 'thumb':
             # 纯 base64 文本（可能为空），前端按需取；不包裹 JSON，避免巨型负载
             print(get_thumb(args.dir, args.name))
+        elif args.action == 'thumb_batch':
+            rels = json.loads(args.rels)
+            print(json.dumps(get_thumbs_batch(args.dir, rels), ensure_ascii=False))
         elif args.action == 'inspect':
             rows = inspect_library(args.dir)
             if not rows:

@@ -6,6 +6,16 @@ use std::process::Command;
 use serde::Serialize;
 use tauri::Manager;
 
+/// Windows：子进程加 CREATE_NO_WINDOW（0x08000000），
+/// 根治 GUI 应用每次调用 Python 子进程时闪现/关闭命令行窗口。
+#[cfg(target_os = "windows")]
+fn hide_console(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+}
+#[cfg(not(target_os = "windows"))]
+fn hide_console(_cmd: &mut Command) {}
+
 /// 解析 Python 解释器优先级：
 /// 1) 环境变量 SCORE_PYTHON（调试/覆盖）
 /// 2) 打包内嵌的 python_dist/python.exe（resource_dir 或 exe 同级目录）
@@ -108,6 +118,7 @@ fn resolve_library_ops(app: &tauri::AppHandle) -> String {
 fn run_python_json(app: &tauri::AppHandle, script: &str, args: &[&str]) -> String {
     let python = resolve_python(app);
     let mut cmd = Command::new(&python);
+    hide_console(&mut cmd);
     if python == "py" {
         cmd.arg("-3");
     }
@@ -138,6 +149,7 @@ struct PyResult {
 fn run_python_full(app: &tauri::AppHandle, script: &str, args: &[&str]) -> PyResult {
     let python = resolve_python(app);
     let mut cmd = Command::new(&python);
+    hide_console(&mut cmd);
     if python == "py" {
         cmd.arg("-3");
     }
@@ -192,6 +204,7 @@ fn process_scores(
     let script = resolve_pipeline(&app);
 
     let mut cmd = Command::new(&python);
+    hide_console(&mut cmd);
     if python == "py" {
         cmd.arg("-3");
     }
@@ -284,6 +297,18 @@ fn get_thumb(app: tauri::AppHandle, dir: String, name: String) -> String {
     run_python_json(&app, &script, &refs)
 }
 
+/// 批量缩略图：一次 Python 进程渲染多张（滚动加载性能关键，杜绝逐张启进程闪窗口）。
+/// rels 为 JSON 数组字符串，如 '["a.pdf","b.pdf"]'。返回 PyResult{ok, out({rel:b64}), ...}。
+#[tauri::command]
+fn get_thumbs_batch(app: tauri::AppHandle, dir: String, rels: String) -> PyResult {
+    let script = resolve_library_ops(&app);
+    let dir = dir.trim().to_string();
+    let rels = rels.trim().to_string();
+    let args = [format!("thumb_batch"), format!("--dir={}", dir), format!("--rels={}", rels)];
+    let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    run_python_full(&app, &script, &refs)
+}
+
 /// 扫描曲库并给出命名规范化建议。返回 PyResult{ok, out(JSON), error, code, stderr}。
 #[tauri::command]
 fn inspect_library(app: tauri::AppHandle, dir: String) -> PyResult {
@@ -341,6 +366,7 @@ fn main() {
             open_path,
             get_library,
             get_thumb,
+            get_thumbs_batch,
             inspect_library,
             rename_items,
             wiki_tag

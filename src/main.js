@@ -293,6 +293,25 @@ async function callThumb(dir, name) {
   return t.trim();
 }
 
+// 批量缩略图：一次后端进程渲染多张（滚动加载性能关键，杜绝逐张启 Python 子进程闪窗口）。
+// Tauri 走 get_thumbs_batch（返回 {ok,out:{rel:b64},...}），本地走 POST /api/thumb_batch。
+async function callThumbsBatch(dir, relsArr) {
+  if (IS_TAURI) {
+    const { invoke } = await import('@tauri-apps/api/core');
+    const r = await invoke('get_thumbs_batch', { dir, rels: JSON.stringify(relsArr) });
+    if (r && r.ok === false) throw new Error((r.error || '后端异常') + (r.code != null ? '（退出码 ' + r.code + '）' : ''));
+    const items = safeParse(r && r.out != null ? r.out : r);
+    return (items && typeof items === 'object') ? items : {};
+  }
+  const r = await fetch('/api/thumb_batch', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ dir, rels: relsArr }),
+  });
+  const j = await r.json();
+  return (j && typeof j === 'object') ? j : {};
+}
+
 async function callInspectLibrary(dir) {
   if (IS_TAURI) {
     const { invoke } = await import('@tauri-apps/api/core');
@@ -416,37 +435,74 @@ async function openPdf(rel) {
   }
 }
 
-// 懒加载缩略图：卡片进入视口才按需取单张，避免一次性渲染全部 PDF 导致卡顿/高占用。
+// ============ 懒加载缩略图（批次 + 节流 + 内存缓存） ============
+// 性能关键：旧实现逐张 callThumb（每张 = 1 次 Python 子进程启动 → 疯狂闪窗口 + 卡顿）。
+// 新实现：进入视口并入队，150ms 节流合并为一次批请求（20 张/批分片，单进程渲染），
+// 命中内存缓存直接填充，滚回不再重取。
+const THUMB_BATCH = 20;
+const THUMB_CACHE = new Map(); // rel -> b64
 let thumbObserver = null;
+let thumbQueue = new Set(); // 待加载的 cover-wrap 元素
+let thumbTimer = null;
+
 function ensureThumbObserver() {
   if (thumbObserver) return thumbObserver;
   thumbObserver = new IntersectionObserver((entries, obs) => {
     entries.forEach((en) => {
       if (!en.isIntersecting) return;
       const wrap = en.target;
-      const name = wrap.dataset.name;
       obs.unobserve(wrap);
-      if (wrap.dataset.loaded) return;
-      wrap.dataset.loaded = '1';
-      loadThumbInto(wrap, name);
+      queueThumb(wrap);
     });
   }, { rootMargin: '240px' });
   return thumbObserver;
 }
 
-async function loadThumbInto(wrap, name) {
-  try {
-    const b64 = await callThumb(dirBox.textContent, name);
-    if (!b64) return; // 取不到则保留占位，不报错
-    const img = document.createElement('img');
-    img.className = 'cover-img';
-    img.loading = 'lazy';
-    img.alt = '';
-    img.src = 'data:image/jpeg;base64,' + b64;
-    const ph = wrap.querySelector('.cover');
-    if (ph) wrap.replaceChild(img, ph);
-  } catch (_) {
-    // 单张失败不影响其余卡片
+function fillThumb(wrap, b64) {
+  const img = document.createElement('img');
+  img.className = 'cover-img';
+  img.loading = 'lazy';
+  img.alt = '';
+  img.src = 'data:image/jpeg;base64,' + b64;
+  const ph = wrap.querySelector('.cover');
+  if (ph) wrap.replaceChild(img, ph);
+}
+
+function queueThumb(wrap) {
+  const rel = wrap.dataset.name;
+  if (!rel || wrap.dataset.loaded) return;
+  if (THUMB_CACHE.has(rel)) {
+    wrap.dataset.loaded = '1';
+    fillThumb(wrap, THUMB_CACHE.get(rel));
+    return;
+  }
+  wrap.dataset.loaded = '1'; // 防重复入队
+  thumbQueue.add(wrap);
+  if (thumbTimer) return;
+  thumbTimer = setTimeout(flushThumbs, 150);
+}
+
+async function flushThumbs() {
+  thumbTimer = null;
+  const wraps = [...thumbQueue];
+  thumbQueue.clear();
+  if (!wraps.length) return;
+  const rels = [...new Set(wraps.map((w) => w.dataset.name))];
+  // 按 20 张分片串行请求，滚动到底也渐进填充
+  for (let i = 0; i < rels.length; i += THUMB_BATCH) {
+    const slice = rels.slice(i, i + THUMB_BATCH);
+    let map = {};
+    try {
+      map = await callThumbsBatch(dirBox.textContent, slice);
+    } catch (_) {
+      map = {};
+    }
+    wraps.forEach((w) => {
+      const rel = w.dataset.name;
+      if (!slice.includes(rel) || !map[rel]) return;
+      THUMB_CACHE.set(rel, map[rel]);
+      fillThumb(w, map[rel]);
+    });
   }
 }
 
