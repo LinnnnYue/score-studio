@@ -258,16 +258,15 @@ body.tauri .win, body.appmode .win {
   font-size: 11px; letter-spacing: .1em; text-transform: uppercase;
   color: var(--muted); margin-bottom: 10px;
 }
-.lib-letters { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 12px; }
-.lib-letter {
-  width: 23px; height: 23px; border-radius: 6px; cursor: pointer;
-  background: transparent; border: 1px solid var(--line-2); color: var(--muted);
-  font-size: 11px; transition: all .15s ease-out;
+.lib-side-search {
+  width: 100%; height: 34px; border-radius: 8px; padding: 0 10px;
+  background: var(--panel); border: 1px solid var(--line-2); color: var(--ivory);
+  font-size: 12px; outline: none; margin-bottom: 12px; transition: border-color .2s ease;
 }
-.lib-letter:hover { border-color: rgba(201,169,97,.45); color: var(--ivory); }
+.lib-side-search:focus { border-color: rgba(201,169,97,.55); }
 .lib-artists {
   flex: 1; min-height: 0; overflow: auto;
-  display: flex; flex-direction: column; gap: 2px; padding-right: 4px;
+  display: flex; flex-direction: column; gap: 4px; padding-right: 6px;
 }
 .lib-artist {
   text-align: left; padding: 7px 10px; border-radius: 8px;

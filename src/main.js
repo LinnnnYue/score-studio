@@ -540,9 +540,7 @@ function renderLibrary(items) {
 function buildSidebar() {
   const artists = Array.from(new Set(libItems.map((i) => i.artist).filter(Boolean)))
     .sort((a, b) => a.localeCompare(b, 'zh'));
-  const lettersWrap = $('libLetters');
   const artistsWrap = $('libArtists');
-  lettersWrap.innerHTML = '';
   artistsWrap.innerHTML = '';
 
   // 全部（置顶，回到未筛选状态）
@@ -553,35 +551,27 @@ function buildSidebar() {
   allBtn.onclick = () => setActiveArtist('全部');
   artistsWrap.appendChild(allBtn);
 
-  // 首字/字母索引（点击平滑滚动到该分组）
-  const letterSet = [];
-  artists.forEach((a) => {
-    const ch = (a[0] || '#').toUpperCase();
-    if (!letterSet.includes(ch)) letterSet.push(ch);
-  });
-  letterSet.slice(0, 28).forEach((ch) => {
-    const b = document.createElement('button');
-    b.className = 'lib-letter';
-    b.textContent = ch;
-    b.title = '跳到 ' + ch;
-    b.onclick = () => {
-      const el = artistsWrap.querySelector('.lib-artist[data-initial="' + ch + '"]');
-      if (el) el.scrollIntoView({ block: 'nearest' });
-    };
-    lettersWrap.appendChild(b);
-  });
-
   // 歌手列表
   artists.forEach((a) => {
-    const ch = (a[0] || '#').toUpperCase();
     const b = document.createElement('button');
     b.className = 'lib-artist' + (activeArtist === a ? ' active' : '');
     b.textContent = a;
     b.dataset.artist = a;
-    b.dataset.initial = ch;
     b.onclick = () => setActiveArtist(a);
     artistsWrap.appendChild(b);
   });
+
+  // 侧边栏内过滤（不触发主区过滤，仅缩小列表）
+  const search = $('libSideSearch');
+  search.value = '';
+  search.oninput = () => {
+    const q = search.value.trim().toLowerCase();
+    artistsWrap.querySelectorAll('.lib-artist').forEach((el) => {
+      const name = el.dataset.artist;
+      const show = name === '全部' || !q || name.toLowerCase().includes(q);
+      el.style.display = show ? 'block' : 'none';
+    });
+  };
 }
 
 // 仅切换选中态，保留侧栏滚动位置（不重建列表）
@@ -608,7 +598,6 @@ async function loadLibrary() {
   const lib = $('libGrid');
   lib.innerHTML = '<div class="hero-p">读取中…</div>';
   $('libArtists').innerHTML = '';
-  $('libLetters').innerHTML = '';
   const dir = dirBox.textContent;
   try {
     const raw = await callLibraryMeta(dir);
