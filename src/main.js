@@ -537,22 +537,60 @@ function renderLibrary(items) {
   });
 }
 
-function buildChips() {
-  const artists = Array.from(new Set(libItems.map((i) => i.artist).filter(Boolean))).sort();
-  const wrap = $('libChips');
-  wrap.innerHTML = '';
+function buildSidebar() {
+  const artists = Array.from(new Set(libItems.map((i) => i.artist).filter(Boolean)))
+    .sort((a, b) => a.localeCompare(b, 'zh'));
+  const lettersWrap = $('libLetters');
+  const artistsWrap = $('libArtists');
+  lettersWrap.innerHTML = '';
+  artistsWrap.innerHTML = '';
+
+  // 全部（置顶，回到未筛选状态）
   const allBtn = document.createElement('button');
-  allBtn.className = 'chip' + (activeArtist === '全部' ? ' active' : '');
+  allBtn.className = 'lib-artist' + (activeArtist === '全部' ? ' active' : '');
   allBtn.textContent = '全部';
-  allBtn.onclick = () => { activeArtist = '全部'; buildChips(); filterLibrary(); };
-  wrap.appendChild(allBtn);
+  allBtn.dataset.artist = '全部';
+  allBtn.onclick = () => setActiveArtist('全部');
+  artistsWrap.appendChild(allBtn);
+
+  // 首字/字母索引（点击平滑滚动到该分组）
+  const letterSet = [];
   artists.forEach((a) => {
-    const b = document.createElement('button');
-    b.className = 'chip' + (activeArtist === a ? ' active' : '');
-    b.textContent = a;
-    b.onclick = () => { activeArtist = a; buildChips(); filterLibrary(); };
-    wrap.appendChild(b);
+    const ch = (a[0] || '#').toUpperCase();
+    if (!letterSet.includes(ch)) letterSet.push(ch);
   });
+  letterSet.slice(0, 28).forEach((ch) => {
+    const b = document.createElement('button');
+    b.className = 'lib-letter';
+    b.textContent = ch;
+    b.title = '跳到 ' + ch;
+    b.onclick = () => {
+      const el = artistsWrap.querySelector('.lib-artist[data-initial="' + ch + '"]');
+      if (el) el.scrollIntoView({ block: 'nearest' });
+    };
+    lettersWrap.appendChild(b);
+  });
+
+  // 歌手列表
+  artists.forEach((a) => {
+    const ch = (a[0] || '#').toUpperCase();
+    const b = document.createElement('button');
+    b.className = 'lib-artist' + (activeArtist === a ? ' active' : '');
+    b.textContent = a;
+    b.dataset.artist = a;
+    b.dataset.initial = ch;
+    b.onclick = () => setActiveArtist(a);
+    artistsWrap.appendChild(b);
+  });
+}
+
+// 仅切换选中态，保留侧栏滚动位置（不重建列表）
+function setActiveArtist(name) {
+  activeArtist = name;
+  $('libArtists').querySelectorAll('.lib-artist').forEach((el) => {
+    el.classList.toggle('active', el.dataset.artist === name);
+  });
+  filterLibrary();
 }
 
 function filterLibrary() {
@@ -569,7 +607,8 @@ function filterLibrary() {
 async function loadLibrary() {
   const lib = $('libGrid');
   lib.innerHTML = '<div class="hero-p">读取中…</div>';
-  $('libChips').innerHTML = '';
+  $('libArtists').innerHTML = '';
+  $('libLetters').innerHTML = '';
   const dir = dirBox.textContent;
   try {
     const raw = await callLibraryMeta(dir);
@@ -584,7 +623,7 @@ async function loadLibrary() {
       return;
     }
     activeArtist = '全部';
-    buildChips();
+    buildSidebar();
     filterLibrary();
   } catch (e) {
     lib.innerHTML = `<div class="hero-p">曲库读取失败（后端异常已显形）：<br>${e && e.message ? e.message : e}<br><span class="muted">目录：${dir}<br>若反复失败请截图本诊断回传。</span></div>`;
