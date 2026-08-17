@@ -1,7 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::env;
-use std::process::Command;
+use std::io::Write;
+use std::process::{Command, Stdio};
 
 use serde::Serialize;
 use tauri::Manager;
@@ -16,11 +17,27 @@ fn hide_console(cmd: &mut Command) {
 #[cfg(not(target_os = "windows"))]
 fn hide_console(_cmd: &mut Command) {}
 
-/// 解析 Python 解释器优先级：
-/// 1) 环境变量 SCORE_PYTHON（调试/覆盖）
-/// 2) 打包内嵌的 python_dist/python.exe（resource_dir 或 exe 同级目录）
-/// 3) 系统已装 Python（py / python / python3）兜底
+/// 解析 Python 解释器优先级（探测式，进程内缓存一次）：
+/// 1) 环境变量 SCORE_PYTHON（调试/覆盖，信任用户）
+/// 2) 打包内嵌 python_dist/python.exe —— 校验 import fitz/PIL/numpy 通过才用；
+///    历史坏包（目录被压平缺 PIL）自动跳过，避免「假可用」导致 ModuleNotFoundError
+/// 3) 系统已装 Python（py -3 / python / python3）—— 同样校验三件套
+/// 4) 兜底 "python"（前端显形诊断）
 fn resolve_python(app: &tauri::AppHandle) -> String {
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| resolve_python_uncached(app)).clone()
+}
+
+fn python_ready(cmd: &mut Command) -> bool {
+    cmd.arg("-c").arg("import fitz, PIL, numpy");
+    hide_console(cmd);
+    match cmd.output() {
+        Ok(o) => o.status.success(),
+        Err(_) => false,
+    }
+}
+
+fn resolve_python_uncached(app: &tauri::AppHandle) -> String {
     if let Ok(p) = env::var("SCORE_PYTHON") {
         if !p.trim().is_empty() {
             return p;
@@ -37,23 +54,44 @@ fn resolve_python(app: &tauri::AppHandle) -> String {
     }
     for p in bundled {
         if p.exists() {
-            return p.to_string_lossy().to_string();
-        }
-    }
-    let candidates: [&str; 3] = ["py", "python", "python3"];
-    for c in candidates {
-        let r = if c == "py" {
-            Command::new(c).arg("-3").arg("--version").output()
-        } else {
-            Command::new(c).arg("--version").output()
-        };
-        if let Ok(o) = r {
-            if o.status.success() {
-                return c.to_string();
+            let mut cmd = Command::new(&p);
+            if python_ready(&mut cmd) {
+                return p.to_string_lossy().to_string();
             }
         }
     }
+    let candidates: [(&str, &[&str]); 3] =
+        [("py", &["-3"]), ("python", &[]), ("python3", &[])];
+    for (c, pre) in candidates {
+        let mut cmd = Command::new(c);
+        cmd.args(pre);
+        if python_ready(&mut cmd) {
+            // 解析真实解释器绝对路径（py launcher → C:\...\python.exe），
+            // 直连真实 python.exe 以彻底绕开 launcher 的 stdin/stdout 转发层（排查 0/888 关键）
+            if let Some(real) = real_python_path(c, pre) {
+                return real;
+            }
+            return c.to_string();
+        }
+    }
     "python".to_string()
+}
+
+/// 解析候选命令对应的真实 python 可执行文件绝对路径（如 `py -3` → C:\Python314\python.exe）。
+fn real_python_path(c: &str, pre: &[&str]) -> Option<String> {
+    let mut cmd = Command::new(c);
+    cmd.args(pre);
+    cmd.arg("-c").arg("import sys; print(sys.executable)");
+    hide_console(&mut cmd);
+    if let Ok(o) = cmd.output() {
+        if o.status.success() {
+            let p = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if !p.is_empty() {
+                return Some(p);
+            }
+        }
+    }
+    None
 }
 
 /// 解析 sheet_pipeline.py 脚本路径：环境变量 > 内嵌 resource_dir/exe 同级 > 当前目录。
@@ -144,6 +182,64 @@ struct PyResult {
     error: Option<String>,
     code: i32,
     stderr: Option<String>,
+}
+
+/// 带 stdin 输入的完整调用：批量数据走 stdin，规避 Windows 命令行 32767 字符上限
+/// （此前巡检数百份时 items JSON 塞命令行 → os error 206 文件名过长）。
+fn run_python_full_stdin(app: &tauri::AppHandle, script: &str, args: &[&str], input: &str) -> PyResult {
+    let python = resolve_python(app);
+    let mut cmd = Command::new(&python);
+    hide_console(&mut cmd);
+    if python == "py" {
+        cmd.arg("-3");
+    }
+    cmd.arg(script);
+    for a in args {
+        cmd.arg(a);
+    }
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return PyResult {
+                ok: false,
+                out: String::new(),
+                error: Some(e.to_string()),
+                code: -1,
+                stderr: None,
+            }
+        }
+    };
+    if let Some(mut si) = child.stdin.take() {
+        let _ = si.write_all(input.as_bytes());
+        let _ = si.flush();
+        // si 在此析构关闭 stdin → Python 读到 EOF
+    }
+    match child.wait_with_output() {
+        Ok(o) => {
+            let out = String::from_utf8_lossy(&o.stdout).to_string();
+            let err = String::from_utf8_lossy(&o.stderr).to_string();
+            let code = o.status.code().unwrap_or(-1);
+            let ok = o.status.success() && !out.trim().is_empty();
+            let err_trim = err.trim().to_string();
+            PyResult {
+                ok,
+                out: out.trim().to_string(),
+                error: if ok { None } else { Some(err_trim.clone()) },
+                code,
+                stderr: if err_trim.is_empty() { None } else { Some(err_trim) },
+            }
+        }
+        Err(e) => PyResult {
+            ok: false,
+            out: String::new(),
+            error: Some(e.to_string()),
+            code: -1,
+            stderr: None,
+        },
+    }
 }
 
 fn run_python_full(app: &tauri::AppHandle, script: &str, args: &[&str]) -> PyResult {
@@ -325,13 +421,25 @@ fn rename_items(app: tauri::AppHandle, dir: String, payload: String) -> String {
     run_python_json(&app, &script, &["rename", "--dir", &dir, "--payload", &payload])
 }
 
-/// 联网识别歌曲的主题曲/影视/动漫/游戏归属（Wikipedia 免费无密钥）。返回 JSON 文本。
+/// 联网补全歌曲的真实专辑归属（iTunes 优先，Wikipedia/本地词库兜底）。返回 JSON 文本。
+/// 用 run_python_full：失败时 stderr/退出码随结果回传，前端显形真实原因（杜绝「不可用」哑弹）。
 #[tauri::command]
-fn wiki_tag(app: tauri::AppHandle, title: String, artist: String) -> String {
+fn album_tag(app: tauri::AppHandle, title: String, artist: String) -> String {
     let script = resolve_library_ops(&app);
     let title = title.trim().to_string();
     let artist = artist.trim().to_string();
-    run_python_json(&app, &script, &["wikitag", "--title", &title, "--artist", &artist])
+    let res = run_python_full(&app, &script, &["albumtag", "--title", &title, "--artist", &artist]);
+    serde_json::to_string(&res).unwrap_or_else(|_| "{\"ok\":false,\"error\":\"序列化失败\"}".into())
+}
+
+/// 批量并发补全专辑（一次 Python 进程并发处理多首，杜绝逐首 round-trip 卡顿）。
+/// items 为 JSON 数组字符串（可能极大）——走 stdin 传参，规避 Windows 命令行 32767 上限。
+/// 返回 PyResult{ok, out, error, code, stderr}。
+#[tauri::command]
+fn album_tag_batch(app: tauri::AppHandle, items: String) -> String {
+    let script = resolve_library_ops(&app);
+    let res = run_python_full_stdin(&app, &script, &["albumbatch"], &items);
+    serde_json::to_string(&res).unwrap_or_else(|_| "{\"ok\":false,\"error\":\"序列化失败\"}".into())
 }
 
 
@@ -369,7 +477,8 @@ fn main() {
             get_thumbs_batch,
             inspect_library,
             rename_items,
-            wiki_tag
+            album_tag,
+            album_tag_batch
         ])
         .setup(|app| {
             // Windows：用 SetWindowRgn 把窗体裁剪为圆角，配合 CSS 半径对齐。

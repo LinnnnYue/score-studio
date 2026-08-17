@@ -23,6 +23,13 @@ import re
 import sys
 import urllib.request
 
+# Windows 下强制 STDIO 为 UTF-8（应用内 Python 默认 GBK/cp936，会导致中文日志/文件名输出乱码或 UnicodeEncodeError）
+for _s in (sys.stdin, sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+
 # ===================== 配置 =====================
 TARGET_WIDTH = 2009          # 标准宽度
 PDF_DPI = 300                # 输出分辨率
@@ -120,12 +127,30 @@ def resize_standard(img):
 
 
 def is_score_candidate(img_bytes_len: int, w: int, h: int) -> bool:
-    """筛选曲谱：高度 > 800px 且体积 > 50KB（排除图标/装饰/头像）。"""
-    return h > 800 and img_bytes_len > 50_000
+    """筛选曲谱：高度 > 800px 且体积 > 50KB 且宽高比贴近 A4（排除图标/装饰/头像/竖版封面）。"""
+    if h <= 800 or img_bytes_len <= 50_000:
+        return False
+    ratio = w / h
+    # A4：竖版 0.707 / 横版 1.414，放宽邻域防轻微变形误滤
+    return 0.65 <= ratio <= 0.80 or 1.30 <= ratio <= 1.50
+
+
+def drop_cover_page(images: list) -> list:
+    """多页一致性：首页比例与其余页（中位数）差异 >5% 时视为封面插画剔除。
+    根治微信文章「封面图混入第一页」问题（如 7rings 0.912 / 过海 1.439 / 归舟 0.75 vs 真谱 0.706）。"""
+    if len(images) < 2:
+        return images
+    rest = [im.width / im.height for im in images[1:]]
+    base = sorted(rest)[len(rest) // 2]  # 中位数，抗噪声
+    first = images[0].width / images[0].height
+    if abs(first - base) / base > 0.05:
+        print(f"  ✗ 剔除封面（首页比例 {first:.3f} vs 曲谱 {base:.3f}）")
+        return images[1:]
+    return images
 
 
 def process_images(urls, is_tan8=False, max_pages=12):
-    """下载→筛选→透明/绿底→缩放，返回 RGB 图列表。"""
+    """下载→筛选→透明/绿底→缩放→封面剔除，返回 RGB 图列表。"""
     from PIL import Image
     out = []
     for url in urls[:max_pages]:
@@ -143,7 +168,7 @@ def process_images(urls, is_tan8=False, max_pages=12):
             print(f"  ✓ {os.path.basename(url)[:34]:34} → {img.size[0]}×{img.size[1]}")
         except Exception as e:
             print(f"  ✗ 跳过 {url[:40]}: {e}")
-    return out
+    return drop_cover_page(out)
 
 
 # ===================== 本地 =====================
@@ -327,6 +352,16 @@ def run(input_str: str, output_dir: str, theme: str = "", custom: str = ""):
         return None
     out = os.path.join(output_dir, name)
     to_pdf(images, out)
+    # 自动写入 PDF /Info 元数据（曲名/歌手/专辑），等价于 MP3 的 ID3，使曲库与播放器可读
+    try:
+        from library_ops import smart_split, write_pdf_metadata
+        base = os.path.splitext(name)[0]
+        mt, ma, malb = smart_split(base)
+        if write_pdf_metadata(out, title=mt or None, artist=ma or None,
+                              album=malb or None):
+            print(f"[元数据] 已写入：曲={mt or '-'} 歌手={ma or '-'} 专辑={malb or '-'}")
+    except Exception as e:
+        print(f"[元数据] 写入跳过：{e}")
     print(f"✅ PDF 已生成：{out}（{len(images)} 页 · {TARGET_WIDTH}px · {PDF_DPI}DPI）")
     return out
 

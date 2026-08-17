@@ -343,16 +343,51 @@ async function callRenameItems(dir, pairs) {
   return safeParse(res) || { results: [] };
 }
 
-async function callWikiTag(title, artist) {
-  let res;
+async function callAlbumTag(title, artist) {
   if (IS_TAURI) {
     const { invoke } = await import('@tauri-apps/api/core');
-    res = await invoke('wiki_tag', { title, artist });
-  } else {
-    const r = await fetch('/api/wikitag?title=' + encodeURIComponent(title) + '&artist=' + encodeURIComponent(artist));
-    res = await r.json();
+    const res = await invoke('album_tag', { title, artist });
+    const p = safeParse(res);
+    if (p && p.ok === false) throw new Error((p.error || '') + (p.stderr ? '\n' + p.stderr : ''));
+    return p && p.ok === true ? safeParse(p.out) : p;
   }
-  return safeParse(res);
+  const r = await fetch('/api/albumtag?title=' + encodeURIComponent(title) + '&artist=' + encodeURIComponent(artist));
+  return safeParse(await r.text());
+}
+
+// 批量并发补全专辑：一次请求后端并发处理（本地兜底 + 联网 iTunes），彻底消除逐行卡顿
+// Tauri 模式返回 PyResult{ok,out,error,code,stderr}——失败时携带真实 stderr，前端显形
+async function callAlbumTagBatch(items) {
+  if (IS_TAURI) {
+    const { invoke } = await import('@tauri-apps/api/core');
+    const res = await invoke('album_tag_batch', { items: JSON.stringify(items) });
+    const p = safeParse(res);
+    if (p && p.ok === false) {
+      const msg = (p.error || 'CLI 执行失败') + (p.stderr ? ' — ' + p.stderr : '');
+      throw new Error(msg);
+    }
+    if (p && p.ok === true) {
+      if (typeof p.out === 'string') {
+        const arr = safeParse(p.out);
+        if (Array.isArray(arr)) return { tags: arr, stderr: p.stderr || '' };
+        throw new Error('后端出参解析失败，out=' + String(p.out).slice(0, 200) + (p.stderr ? ' stderr=' + p.stderr : ''));
+      }
+      return { tags: Array.isArray(p.out) ? p.out : [], stderr: p.stderr || '' };
+    }
+    return Array.isArray(p) ? { tags: p, stderr: '' } : { tags: [], stderr: '' };
+  } else {
+    try {
+      const r = await fetch('/api/albumbatch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ items }),
+      });
+      const j = await r.json();
+      return { tags: (j && j.albums) || [], stderr: (j && j.error) || '' };
+    } catch (_) {
+      return { tags: [], stderr: '本地模式调用失败' };
+    }
+  }
 }
 
 async function openOutputDir() {
@@ -410,8 +445,6 @@ $('runBtn').onclick = async () => {
 
 // ============ 曲库 ============
 let libItems = [];
-let activeArtist = '全部';
-
 function fmtBytes(b) {
   if (b < 1024) return b + ' B';
   if (b < 1024 * 1024) return (b / 1024).toFixed(1) + ' KB';
@@ -522,7 +555,7 @@ function renderLibrary(items) {
     c.dataset.name = rel;
     // 占位封面（真实缩略图由懒加载填充）
     const cover = '<div class="cover">谱</div>';
-    const themeChip = it.theme ? `<span class="theme-chip">${it.theme}</span>` : '';
+    const themeChip = it.album ? `<span class="theme-chip">${it.album}</span>` : '';
     const meta = `<div class="meta-row"><span>${it.pages || '?'} 页</span><span>${fmtBytes(it.size)}</span></div>`;
     c.innerHTML = `
       <div class="cover-wrap" data-name="${rel}">${cover}<div class="cover-overlay"><span class="open-hint">打开 PDF</span></div></div>
@@ -537,59 +570,11 @@ function renderLibrary(items) {
   });
 }
 
-function buildSidebar() {
-  const artists = Array.from(new Set(libItems.map((i) => i.artist).filter(Boolean)))
-    .sort((a, b) => a.localeCompare(b, 'zh'));
-  const artistsWrap = $('libArtists');
-  artistsWrap.innerHTML = '';
-
-  // 全部（置顶，回到未筛选状态）
-  const allBtn = document.createElement('button');
-  allBtn.className = 'lib-artist' + (activeArtist === '全部' ? ' active' : '');
-  allBtn.textContent = '全部';
-  allBtn.dataset.artist = '全部';
-  allBtn.onclick = () => setActiveArtist('全部');
-  artistsWrap.appendChild(allBtn);
-
-  // 歌手列表
-  artists.forEach((a) => {
-    const b = document.createElement('button');
-    b.className = 'lib-artist' + (activeArtist === a ? ' active' : '');
-    b.textContent = a;
-    b.dataset.artist = a;
-    b.onclick = () => setActiveArtist(a);
-    artistsWrap.appendChild(b);
-  });
-
-  // 侧边栏内过滤（不触发主区过滤，仅缩小列表）
-  const search = $('libSideSearch');
-  search.value = '';
-  search.oninput = () => {
-    const q = search.value.trim().toLowerCase();
-    artistsWrap.querySelectorAll('.lib-artist').forEach((el) => {
-      const name = el.dataset.artist;
-      const show = name === '全部' || !q || name.toLowerCase().includes(q);
-      el.style.display = show ? 'block' : 'none';
-    });
-  };
-}
-
-// 仅切换选中态，保留侧栏滚动位置（不重建列表）
-function setActiveArtist(name) {
-  activeArtist = name;
-  $('libArtists').querySelectorAll('.lib-artist').forEach((el) => {
-    el.classList.toggle('active', el.dataset.artist === name);
-  });
-  filterLibrary();
-}
-
 function filterLibrary() {
   const q = $('libSearch').value.trim().toLowerCase();
   const filtered = libItems.filter((it) => {
-    const hit = !q || [it.title, it.artist, it.theme, it.name.replace(/\.pdf$/i, '')]
+    return !q || [it.title, it.artist, it.album, it.name.replace(/\.pdf$/i, '')]
       .some((s) => s && s.toLowerCase().includes(q));
-    const artistOk = activeArtist === '全部' || it.artist === activeArtist;
-    return hit && artistOk;
   });
   renderLibrary(filtered);
 }
@@ -597,7 +582,6 @@ function filterLibrary() {
 async function loadLibrary() {
   const lib = $('libGrid');
   lib.innerHTML = '<div class="hero-p">读取中…</div>';
-  $('libArtists').innerHTML = '';
   const dir = dirBox.textContent;
   try {
     const raw = await callLibraryMeta(dir);
@@ -611,8 +595,6 @@ async function loadLibrary() {
       statText.textContent = '曲库为空：' + dir;
       return;
     }
-    activeArtist = '全部';
-    buildSidebar();
     filterLibrary();
   } catch (e) {
     lib.innerHTML = `<div class="hero-p">曲库读取失败（后端异常已显形）：<br>${e && e.message ? e.message : e}<br><span class="muted">目录：${dir}<br>若反复失败请截图本诊断回传。</span></div>`;
@@ -652,26 +634,27 @@ function renderInspect() {
     wrap.innerHTML = '<div class="hero-p">点击「扫描曲库」开始巡检。</div>';
     return;
   }
-  let html = '<div class="insp-head"><span>当前文件名</span><span>解析结果</span><span>首页文字摘要</span><span>建议新名</span><span>主题标签</span><span>采纳</span></div>';
+  let html = '<div class="insp-head"><span>当前文件名</span><span>解析结果</span><span>建议新名</span><span>专辑</span><span>采纳</span></div>';
   html += '<div class="insp-list">';
   inspRows.forEach((r, i) => {
     const checked = inspSelected.has(i) ? 'checked' : '';
-    const cur = `<b>${r.cur_title || '?'}</b><br><span class="sub">${r.cur_artist || '未知歌手'}${r.cur_theme ? ' · ' + r.cur_theme : ''}</span>`;
+    const curParts = [];
+    if (r.cur_album) curParts.push('专·' + r.cur_album);
+    const cur = `<b>${r.cur_title || '?'}</b><br><span class="sub">${r.cur_artist || '未知歌手'}${curParts.length ? ' · ' + curParts.join(' · ') : ''}</span>`;
     const det = r.has_text
-      ? `<span class="ok">✓ 检测到文字</span><br><b>${r.det_title || '—'}</b> / ${r.det_artist || '—'}`
+      ? `<span class="ok">✓ 文字</span> <b>${r.det_title || '—'}</b> / ${r.det_artist || '—'}`
       : '<span class="warn">扫描件/无文字</span>';
     const excerpt = `<div class="excerpt" title="${(r.text_excerpt || '').replace(/"/g, '&quot;')}">${r.text_excerpt || '—'}</div>`;
-    const tag = r.sug_theme
-      ? `<span class="theme-chip">${r.sug_theme}</span>`
-      : '<span class="muted">无</span>';
+    const album = r.sug_album
+      ? `<span class="theme-chip" title="来源：${r.meta_album ? 'PDF元数据' : (r.cur_album ? '文件名' : '识别')}">${r.sug_album}</span>${r.sug_category ? `<span class="cat-chip">${r.sug_category}</span>` : ''}`
+      : '<span class="muted">未定</span>';
     const rowClass = r.needs_rename ? 'needs' : 'ok';
     html += `
       <div class="insp-row ${rowClass}" data-idx="${i}">
         <div class="cell-name" title="${r.name}">${r.name}</div>
-        <div class="cell-cur">${cur}</div>
-        <div class="cell-text">${det}<br>${excerpt}</div>
+        <div class="cell-cur">${cur}<br>${det}${excerpt}</div>
         <div class="cell-sug" title="${r.suggested}">${r.suggested}</div>
-        <div class="cell-tag" data-tag-idx="${i}">${tag}</div>
+        <div class="cell-album" data-album-idx="${i}">${album}</div>
         <div class="cell-check"><input type="checkbox" ${checked} ${!r.needs_rename ? 'disabled' : ''}></div>
       </div>`;
   });
@@ -711,27 +694,68 @@ async function loadInspect() {
 
 $('scanBtn').addEventListener('click', loadInspect);
 
-$('wikiAllBtn').addEventListener('click', async () => {
-  statText.textContent = '正在联网识别主题曲归属…';
+$('selAllBtn').addEventListener('click', () => {
+  inspRows.forEach((r, i) => { if (r.needs_rename) inspSelected.add(i); });
+  renderInspect();
+  updateApplyButton();
+});
+$('selNoneBtn').addEventListener('click', () => {
+  inspSelected.clear();
+  renderInspect();
+  updateApplyButton();
+});
+
+$('albumAllBtn').addEventListener('click', async () => {
+  const targets = inspRows.filter((r) => r.sug_title);
+  if (!targets.length) {
+    statText.textContent = '没有可识别的条目（请先巡检并保留曲名）';
+    return;
+  }
+  statText.textContent = `正在联网补全专辑（分批 ${targets.length} 项，实时更新进度）…`;
+  const total = targets.length;
+  const BATCH = 60;
   let changed = 0;
-  for (let i = 0; i < inspRows.length; i++) {
-    const r = inspRows[i];
-    if (!r.sug_title) continue;
+  let localHit = 0;
+  for (let off = 0; off < total; off += BATCH) {
+    const chunk = targets.slice(off, off + BATCH);
+    const items = chunk.map((c) => ({ title: c.sug_title, artist: c.sug_artist || '' }));
+    statText.textContent = `正在联网补全专辑（${Math.min(off + BATCH, total)}/${total} 项，实时更新）…`;
+    let r = null;
     try {
-      const tag = await callWikiTag(r.sug_title, r.sug_artist);
-      if (tag && tag.tag) {
-        r.sug_theme = tag.tag;
-        const segs = [r.sug_title, r.sug_artist, r.sug_theme].filter((s) => s && s.trim());
-        r.suggested = segs.join('-') + '.pdf';
-        r.needs_rename = true;
-        changed++;
-      }
-    } catch (_) {
-      // 单个失败继续
+      r = await callAlbumTagBatch(items);
+    } catch (e) {
+      statText.textContent = '专辑服务失败（真实原因）：' + (e && e.message ? e.message : e);
+      renderInspect();
+      return;
     }
+    const tags = r ? r.tags : [];
+    const backendStderr = r ? r.stderr || '' : '';
+    if (!tags || !Array.isArray(tags)) {
+      statText.textContent = '专辑服务暂不可用（网络与本地兜底均失败）' + (backendStderr ? ' stderr:' + backendStderr : '');
+      renderInspect();
+      return;
+    }
+    if (tags.length === 0) {
+      statText.textContent = `⚠ 后端返回空数组（收到 items=${items.length} 条）。后端诊断：${backendStderr || '无'}`;
+      renderInspect();
+      return;
+    }
+    chunk.forEach((c, i) => {
+      const tag = tags[i];
+      if (tag && tag.album) {
+        c.sug_album = tag.album;
+        if (tag.category && !c.sug_category) c.sug_category = tag.category;
+        const segs = [c.sug_title, c.sug_artist, c.sug_album].filter((s) => s && s.trim());
+        c.suggested = segs.join('-') + '.pdf';
+        c.needs_rename = true;
+        changed++;
+        if (tag.source === 'local') localHit++;
+      }
+    });
   }
   renderInspect();
-  statText.textContent = `联网识别完成：${changed} 份更新主题标签`;
+  const extra = localHit ? `（其中本地词库兜底 ${localHit} 项，未联网）` : '';
+  statText.textContent = `专辑补全完成：${changed}/${total} 份更新专辑${extra}`;
 });
 
 $('applyBtn').addEventListener('click', async () => {

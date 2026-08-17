@@ -47,7 +47,7 @@
       <div class="view" id="view-process">
         <div class="hero-h">将散落的曲谱，皈依为统一形制</div>
         <div class="hero-p">粘贴微信公众号 / 弹琴吧 / 人人文档 / 抖音图文链接，或拖入本地图片与 PDF。<b>提取 → 透明转白底 → LANCZOS 缩放至 2009px → 300DPI·95 PDF</b>，输出至你指定的目录。</div>
-        <div class="naming-rule">命名规则：<b>曲名 - 歌手 - 主题来源</b>（主题来源可选，无则省略）</div>
+        <div class="naming-rule">命名规则：<b>曲名 - 歌手 - 专辑 - 编配</b>（专辑/编配可选，无则省略；按 MP3 网络音乐元数据规范）</div>
 
         <div class="field-label">SOURCE · 来源链接</div>
         <div class="input-row">
@@ -80,11 +80,6 @@
       <!-- 曲库视图 -->
       <div class="view hidden" id="view-library">
         <div class="lib-body">
-          <aside class="lib-side">
-            <div class="lib-side-title">歌手 / 艺术家</div>
-            <input class="lib-side-search" id="libSideSearch" placeholder="过滤歌手…" />
-            <div class="lib-artists" id="libArtists"></div>
-          </aside>
           <div class="lib-main">
             <div class="lib-toolbar">
               <div>
@@ -92,7 +87,7 @@
                 <div class="hero-p">统一 2009px 宽 · 300DPI · 白底 PDF，归档于此。</div>
               </div>
               <div class="lib-search-wrap">
-                <input class="input lib-search" id="libSearch" placeholder="搜索 曲名 / 歌手 / 主题标签…" />
+                <input class="input lib-search" id="libSearch" placeholder="搜索 曲名 / 歌手 / 专辑…" />
               </div>
             </div>
             <div class="grid" id="libGrid"></div>
@@ -103,10 +98,12 @@
       <!-- 巡检视图 -->
       <div class="view hidden" id="view-inspect">
         <div class="hero-h">巡检 · 命名规范化</div>
-        <div class="hero-p">扫描曲库命名结构，提取 PDF 首页标题/歌手，联网识别主题曲归属。先预览，确认后再改文件名。</div>
+        <div class="hero-p">扫描曲库命名结构，提取 PDF 首页标题/歌手，联网补全真实专辑（iTunes 取证，动漫/游戏/影视 IP 本地兜底）。先预览，确认后再改文件名。</div>
         <div class="insp-actions">
           <button class="btn-gold" id="scanBtn">扫描曲库</button>
-          <button class="btn-ghost" id="wikiAllBtn">联网识别主题曲</button>
+          <button class="btn-ghost" id="albumAllBtn">联网补全专辑</button>
+          <button class="btn-ghost" id="selAllBtn">全选</button>
+          <button class="btn-ghost" id="selNoneBtn">取消全选</button>
           <button class="btn-gold" id="applyBtn" disabled>执行改名 <span id="applyCount">0</span></button>
         </div>
         <div class="insp-wrap" id="inspWrap">
@@ -129,7 +126,7 @@
           </div>
           <div class="set">
             <h4>命名与题注</h4>
-            <div class="row"><span class="k">文件名规则</span><span class="v" style="font-family:var(--sans);font-size:11px;">曲名-歌手-主题来源</span></div>
+            <div class="row"><span class="k">文件名规则</span><span class="v" style="font-family:var(--sans);font-size:11px;">曲名-歌手-专辑-编配</span></div>
             <div class="row"><span class="k">主题来源标注</span><div class="toggle" id="themeToggle"></div></div>
             <div class="row"><span class="k">外壳主题</span><span class="v">巴洛克</span></div>
           </div>

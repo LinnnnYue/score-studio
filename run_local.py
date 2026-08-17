@@ -41,7 +41,7 @@ def safe_upload_name(name: str) -> str:
 
 class Handler(BaseHTTPRequestHandler):
     def _send(self, code, body, ctype="application/json; charset=utf-8"):
-        if isinstance(body, (dict, list)):
+        if isinstance(body, (dict, list)) or body is None:
             body = json.dumps(body, ensure_ascii=False)
         if isinstance(body, str):
             body = body.encode("utf-8")
@@ -94,12 +94,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, libops.inspect_library(d))
             except Exception as e:
                 return self._send(200, [], ctype="application/json; charset=utf-8")
-        if parsed.path == "/api/wikitag":
+        if parsed.path == "/api/albumtag":
             q = urllib.parse.parse_qs(parsed.query)
             title = q.get("title", [""])[0]
             artist = q.get("artist", [""])[0]
             try:
-                return self._send(200, libops.wiki_tag(title, artist))
+                return self._send(200, libops.album_tag(title, artist))
             except Exception:
                 return self._send(200, None, ctype="application/json; charset=utf-8")
         if parsed.path == "/api/file":
@@ -157,6 +157,18 @@ class Handler(BaseHTTPRequestHandler):
             d = payload.get("dir", "")
             pairs = payload.get("pairs", [])
             return self._send(200, libops.rename_items(d, pairs))
+        if parsed.path == "/api/albumbatch":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                payload = json.loads(self.rfile.read(length) or b"{}")
+            except Exception as e:
+                return self._send(400, {"ok": False, "error": f"请求解析失败：{e}"})
+            items = payload.get("items", [])
+            try:
+                tags = libops.album_tag_batch(items)
+                return self._send(200, {"ok": True, "albums": tags})
+            except Exception as e:
+                return self._send(200, {"ok": False, "albums": [], "error": str(e)})
         if parsed.path != "/api/process":
             return self._send(404, {"error": "not found"}, ctype="text/plain; charset=utf-8")
         try:

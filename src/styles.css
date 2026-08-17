@@ -248,7 +248,7 @@ body.tauri .win, body.appmode .win {
 
 /* ===== 曲库：左侧艺术家目录 + 右侧封面墙（方案 B） ===== */
 #view-library { position: relative; overflow: hidden; }
-.lib-body { position: absolute; inset: 6px 30px 28px; display: flex; gap: 20px; }
+.lib-body { position: absolute; inset: 6px 30px 28px; display: flex; }
 .lib-side {
   width: 232px; flex-shrink: 0; min-height: 0;
   display: flex; flex-direction: column;
@@ -350,7 +350,7 @@ body.tauri .win, body.appmode .win {
 }
 .insp-wrap { display: flex; flex-direction: column; gap: 2px; }
 .insp-head, .insp-row {
-  display: grid; grid-template-columns: 1.4fr 1fr 1.4fr 1.2fr 90px 52px;
+  display: grid; grid-template-columns: 1.4fr 1fr 1.2fr 1.4fr 52px;
   gap: 10px; align-items: center;
   padding: 12px 10px; font-size: 12px;
 }
@@ -369,9 +369,16 @@ body.tauri .win, body.appmode .win {
 
 .cell-name { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .cell-cur .sub { color: var(--muted); font-size: 10.5px; }
-.cell-text .ok { color: #8fd6a0; }
-.cell-text .warn { color: #e3c789; }
+.cell-cur .ok { color: #8fd6a0; }
+.cell-cur .warn { color: #e3c789; }
 .cell-sug { color: var(--gold-2); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cell-album { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cell-arr { color: var(--muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cat-chip {
+  display: inline-block; margin-left: 4px; padding: 1px 6px; border-radius: 8px;
+  font-size: 10px; color: #c9b87a; border: 1px solid rgba(201,185,122,.35);
+  vertical-align: 1px;
+}
 .cell-check { text-align: center; }
 .cell-check input { width: 16px; height: 16px; accent-color: var(--gold); cursor: pointer; }
 .excerpt {
