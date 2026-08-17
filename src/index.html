@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Score Studio · 曲谱工坊</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+<div class="win" id="win">
+  <div class="app">
+    <!-- 左侧导航 -->
+    <div class="sidebar">
+      <div class="brand">
+        <svg class="violin" viewBox="0 0 24 24" fill="none" stroke="#c9a961" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M9 3l3 2 3-2M12 5v3M8 8c0 4 2 5 4 5s4-1 4-5M12 13v5M9 21l3-3 3 3"/>
+          <path d="M9.5 9.5h5M9.5 11h5" opacity="0.5"/>
+        </svg>
+        <div>
+          <div class="name">Score<b>·</b>Studio</div>
+          <div class="sub">曲谱工坊</div>
+        </div>
+      </div>
+      <div class="nav-title">ATELIER</div>
+      <div class="nav-item active" data-view="process"><span class="ic">⌘</span> 处理台</div>
+      <div class="nav-item" data-view="library"><span class="ic">♪</span> 曲库</div>
+      <div class="nav-item" data-view="inspect"><span class="ic">❖</span> 巡检</div>
+      <div class="nav-item" data-view="settings"><span class="ic">⚙</span> 设置</div>
+      <div class="foot">古典 · 巴洛克<br/>主题外壳 v0.1<br/><span style="color:var(--gold)">锚点：无边框高级感</span></div>
+    </div>
+
+    <!-- 主区 -->
+    <div class="main">
+      <div class="topbar">
+        <div class="crumb">处理台 <span class="gold">/</span> <span id="crumbSub">提取与标准</span></div>
+        <div class="top-right">
+          <div class="pill" id="themePill">主题来源标注 · 开</div>
+          <div class="ctrls">
+            <button class="btn min" title="最小化"><svg viewBox="0 0 15 15"><rect x="2.5" y="6.6" width="10" height="1.6" rx="0.8" fill="currentColor"/></svg></button>
+            <button class="btn max" title="最大化"><svg viewBox="0 0 15 15"><rect x="3" y="3" width="9" height="9" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></button>
+            <button class="btn close" title="关闭"><svg viewBox="0 0 15 15"><path d="M3.6 3.6l7.8 7.8M11.4 3.6l-7.8 7.8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 处理台视图 -->
+      <div class="view" id="view-process">
+        <div class="hero-h">将散落的曲谱，皈依为统一形制</div>
+        <div class="hero-p">粘贴微信公众号 / 弹琴吧 / 人人文档 / 抖音图文链接，或拖入本地图片与 PDF。<b>提取 → 透明转白底 → LANCZOS 缩放至 2009px → 300DPI·95 PDF</b>，输出至你指定的目录。</div>
+        <div class="naming-rule">命名规则：<b>曲名 - 歌手 - 主题来源</b>（主题来源可选，无则省略）</div>
+
+        <div class="field-label">SOURCE · 来源链接</div>
+        <div class="input-row">
+          <input class="input" id="linkInput" placeholder="https://mp.weixin.qq.com/s/...  或  tan8.com / 抖音图文 ..." />
+          <button class="btn-gold" id="addBtn">收入队列</button>
+        </div>
+
+        <div class="field-label">DROP · 拖拽或点选本地文件</div>
+        <div class="drop" id="drop">
+          <div class="big">将曲谱图片 / 文件夹拖入此处</div>
+          <div>支持 PNG · JPEG · 本地 PDF（自动重处理为统一形制）</div>
+        </div>
+
+        <div class="field-label">OUTPUT · 输出目录</div>
+        <div class="dir-row">
+          <div class="dir-box" id="dirBox">G:\Lin_File\Documents\曲谱</div>
+          <button class="btn-ghost" id="dirBtn">选择目录</button>
+        </div>
+
+        <div class="sec-title">队列 <span class="ln"></span></div>
+        <div class="queue" id="queue"></div>
+        <div style="margin-top:18px; display:flex; gap:12px; flex-wrap:wrap;">
+          <button class="btn-gold" id="runBtn">开始处理</button>
+          <button class="btn-ghost" id="clearBtn">清空队列</button>
+          <button class="btn-ghost" id="openOutBtn">打开输出目录</button>
+        </div>
+        <div class="log hidden" id="logBox"></div>
+      </div>
+
+      <!-- 曲库视图 -->
+      <div class="view hidden" id="view-library">
+        <div class="lib-toolbar">
+          <div>
+            <div class="hero-h">已皈依的形制</div>
+            <div class="hero-p">统一 2009px 宽 · 300DPI · 白底 PDF，归档于此。</div>
+          </div>
+          <div class="lib-search-wrap">
+            <input class="input lib-search" id="libSearch" placeholder="搜索 曲名 / 歌手 / 主题标签…" />
+          </div>
+        </div>
+        <div class="chips" id="libChips"></div>
+        <div class="grid" id="libGrid"></div>
+      </div>
+
+      <!-- 巡检视图 -->
+      <div class="view hidden" id="view-inspect">
+        <div class="hero-h">巡检 · 命名规范化</div>
+        <div class="hero-p">扫描曲库命名结构，提取 PDF 首页标题/歌手，联网识别主题曲归属。先预览，确认后再改文件名。</div>
+        <div class="insp-actions">
+          <button class="btn-gold" id="scanBtn">扫描曲库</button>
+          <button class="btn-ghost" id="wikiAllBtn">联网识别主题曲</button>
+          <button class="btn-gold" id="applyBtn" disabled>执行改名 <span id="applyCount">0</span></button>
+        </div>
+        <div class="insp-wrap" id="inspWrap">
+          <div class="hero-p">点击「扫描曲库」开始巡检。</div>
+        </div>
+      </div>
+
+      <!-- 设置视图 -->
+      <div class="view hidden" id="view-settings">
+        <div class="hero-h">工坊形制</div>
+        <div class="hero-p">默认值已按你的标准预设，一般无需改动。</div>
+        <div class="set-grid">
+          <div class="set">
+            <h4>处理参数</h4>
+            <div class="row"><span class="k">目标宽度</span><span class="v">2009 px</span></div>
+            <div class="row"><span class="k">缩放算法</span><span class="v">LANCZOS</span></div>
+            <div class="row"><span class="k">输出分辨率</span><span class="v">300 DPI</span></div>
+            <div class="row"><span class="k">PDF 质量</span><span class="v">95</span></div>
+            <div class="row"><span class="k">透明底→白底</span><span class="v">开</span></div>
+          </div>
+          <div class="set">
+            <h4>命名与题注</h4>
+            <div class="row"><span class="k">文件名规则</span><span class="v" style="font-family:var(--sans);font-size:11px;">曲名-歌手-主题来源</span></div>
+            <div class="row"><span class="k">主题来源标注</span><div class="toggle" id="themeToggle"></div></div>
+            <div class="row"><span class="k">外壳主题</span><span class="v">巴洛克</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="statusbar">
+        <span><span class="dot"></span><span id="statText">就绪 · 待收入链接</span></span>
+        <span>Score Studio · 锚定无边框高级感</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script type="module" src="main.js"></script>
+</body>
+</html>

@@ -1,0 +1,21 @@
+# 构建产物（体积巨大，不纳入版本控制）
+python_dist/
+target/
+node_modules/
+dist/
+
+# 运行时缓存
+.score-studio-cache/
+*.log
+__pycache__/
+*.pyc
+
+# gitnexus 索引
+.gitnexus/
+
+# 临时文件
+*.exe
+*.zip
+*.pdb
+_repro*
+Score-Studio-Portable/

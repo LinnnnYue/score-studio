@@ -1,0 +1,22 @@
+{
+  "name": "score-studio",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Score Studio · 曲谱工坊（巴洛克古典主题外壳 · Tauri v2 骨架）",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "local": "python run_local.py"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.4.0",
+    "@tauri-apps/plugin-dialog": "^2.2.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.4.0",
+    "vite": "^5.4.0"
+  }
+}

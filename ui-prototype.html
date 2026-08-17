@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Score Studio · 曲谱工坊 — 巴洛克古典主题原型</title>
+<style>
+  :root {
+    --ink: #16130e;          /* 深墨暖黑 */
+    --ink-2: #1d1913;
+    --panel: rgba(236,229,216,0.03);
+    --ivory: #ece5d8;        /* 象牙白文字 */
+    --muted: #8f8674;
+    --gold: #c9a961;         /* 金箔强调 */
+    --gold-2: #e3c789;
+    --line: rgba(236,229,216,0.07);
+    --line-2: rgba(236,229,216,0.12);
+    --serif: "Songti SC","STSong","Noto Serif SC","Source Han Serif SC",serif;
+    --serif-en: "Cormorant Garamond",Georgia,"Times New Roman",serif;
+    --sans: "PingFang SC","Microsoft YaHei",sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    display: flex; align-items: center; justify-content: center;
+    background: radial-gradient(1100px 800px at 38% 22%, #2a241b, #0e0c09 75%);
+    font-family: var(--sans); color: var(--ivory);
+  }
+
+  /* ===== 无边框窗口：圆角 + 弥散阴影，无可见框线 ===== */
+  .win {
+    width: 1020px; height: 680px; max-width: 96vw; max-height: 94vh;
+    border-radius: 20px; overflow: hidden;
+    background: var(--ink);
+    box-shadow: 0 60px 180px -40px rgba(0,0,0,0.8);
+    display: flex; flex-direction: column;
+    position: relative;
+  }
+  /* 顶部极淡穹顶放射纹（教堂感，克制） */
+  .win::before {
+    content: ""; position: absolute; top: -260px; left: 50%; transform: translateX(-50%);
+    width: 900px; height: 520px; pointer-events: none;
+    background: repeating-conic-gradient(from 0deg at 50% 100%,
+      rgba(201,169,97,0.04) 0deg 1.4deg, transparent 1.4deg 7deg);
+    -webkit-mask-image: radial-gradient(closest-side, #000 40%, transparent 72%);
+    mask-image: radial-gradient(closest-side, #000 40%, transparent 72%);
+  }
+
+  .app { display: flex; flex: 1; min-height: 0; position: relative; z-index: 1; }
+
+  /* ===== 左侧导航：与内容区无竖线，靠背景色差异区分 ===== */
+  .sidebar {
+    width: 218px; flex-shrink: 0;
+    background: var(--ink-2);
+    display: flex; flex-direction: column; padding: 22px 14px 16px;
+  }
+  .brand { display: flex; align-items: center; gap: 11px; padding: 0 10px 22px; }
+  .violin { width: 30px; height: 30px; }
+  .brand .name { font-family: var(--serif); font-size: 18px; font-weight: 600; letter-spacing: 1px; }
+  .brand .name b { color: var(--gold); font-weight: 600; }
+  .brand .sub { font-size: 10px; color: var(--muted); letter-spacing: 2px; margin-top: 1px; }
+
+  .nav-title { color: var(--muted); font-size: 10px; padding: 4px 12px 8px; letter-spacing: 2px; font-family: var(--serif-en); }
+  .nav-item {
+    position: relative; display: flex; align-items: center; gap: 11px;
+    padding: 10px 13px; border-radius: 9px; cursor: pointer;
+    color: var(--muted); font-size: 13.5px; transition: background .15s ease, color .15s ease;
+  }
+  .nav-item:hover { background: rgba(236,229,216,0.04); color: var(--ivory); }
+  .nav-item.active { background: rgba(201,169,97,0.10); color: var(--ivory); }
+  .nav-item.active::before {
+    content: ""; position: absolute; left: 0; top: 18%; bottom: 18%; width: 3px;
+    border-radius: 2px; background: var(--gold);
+  }
+  .nav-item .ic { width: 17px; text-align: center; color: var(--gold); }
+  .sidebar .foot { margin-top: auto; padding: 14px 12px 0; color: var(--muted); font-size: 10.5px; line-height: 1.7; border-top: 1px solid var(--line); }
+
+  /* ===== 主区：背景随页面，标题栏透明 ===== */
+  .main { flex: 1; display: flex; flex-direction: column; min-width: 0; background: var(--ink); transition: background .4s ease; }
+
+  .topbar {
+    height: 56px; flex-shrink: 0; display: flex; align-items: center; justify-content: space-between;
+    padding: 0 14px 0 22px; background: transparent; -webkit-app-region: drag;
+  }
+  .crumb { font-family: var(--serif); font-size: 15px; letter-spacing: 0.5px; }
+  .crumb .gold { color: var(--gold); }
+  .top-right { display: flex; align-items: center; gap: 14px; -webkit-app-region: no-drag; }
+  .pill {
+    font-size: 11px; color: var(--muted); border: 1px solid var(--line-2);
+    padding: 5px 12px; border-radius: 999px;
+  }
+  .ctrls { display: flex; align-items: center; gap: 4px; }
+  .btn {
+    width: 42px; height: 42px; border: none; border-radius: 10px; background: transparent;
+    color: var(--muted); cursor: pointer; display: flex; align-items: center; justify-content: center;
+    transition: background .15s ease, color .15s ease;
+  }
+  .btn:hover { background: rgba(236,229,216,0.07); color: var(--ivory); }
+  .btn.close:hover { background: #e81123; color: #fff; }
+  .btn svg { width: 14px; height: 14px; display: block; }
+
+  .view { flex: 1; overflow: auto; padding: 6px 30px 28px; }
+
+  /* 处理视图 */
+  .hero-h { font-family: var(--serif); font-size: 26px; font-weight: 600; letter-spacing: 0.5px; margin: 4px 0 4px; }
+  .hero-p { color: var(--muted); font-size: 13px; margin-bottom: 22px; max-width: 640px; line-height: 1.7; }
+  .hero-p b { color: var(--gold-2); font-weight: 500; }
+
+  .field-label { font-size: 11px; color: var(--muted); letter-spacing: 1.5px; margin-bottom: 9px; font-family: var(--serif-en); }
+  .input-row { display: flex; gap: 12px; margin-bottom: 18px; }
+  .input {
+    flex: 1; height: 46px; border-radius: 12px; padding: 0 16px;
+    background: var(--panel); border: 1px solid var(--line-2); color: var(--ivory);
+    font-size: 13.5px; font-family: var(--sans); outline: none; transition: border-color .2s ease;
+  }
+  .input:focus { border-color: rgba(201,169,97,0.55); }
+  .btn-gold {
+    height: 46px; padding: 0 22px; border: none; border-radius: 12px; cursor: pointer;
+    background: linear-gradient(135deg, var(--gold-2), var(--gold)); color: #20180a;
+    font-weight: 700; font-size: 13.5px; transition: transform .15s ease, box-shadow .2s ease;
+    box-shadow: 0 10px 24px -10px rgba(201,169,97,0.6);
+  }
+  .btn-gold:hover { transform: translateY(-1px); }
+  .btn-gold:active { transform: scale(0.97); }
+
+  /* 拖拽区：拱形 + 五线谱纹理 */
+  .drop {
+    border: 1.5px dashed rgba(201,169,97,0.35); border-radius: 18px 18px 14px 14px;
+    background:
+      repeating-linear-gradient(to bottom, transparent 0 11px, rgba(236,229,216,0.05) 11px 12px) ,
+      var(--panel);
+    padding: 26px; text-align: center; color: var(--muted); font-size: 12.5px;
+    margin-bottom: 18px; height: 130px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;
+    transition: border-color .2s ease, background .2s ease;
+  }
+  .drop.hover { border-color: var(--gold); background: rgba(201,169,97,0.06); }
+  .drop .big { font-family: var(--serif); font-size: 15px; color: var(--ivory); }
+
+  .dir-row { display: flex; align-items: center; gap: 12px; margin-bottom: 24px; }
+  .dir-box {
+    flex: 1; height: 42px; border-radius: 11px; padding: 0 14px; display: flex; align-items: center;
+    background: var(--panel); border: 1px solid var(--line-2); color: var(--muted); font-size: 12.5px;
+    overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+  }
+  .btn-ghost {
+    height: 42px; padding: 0 16px; border-radius: 11px; cursor: pointer; flex-shrink: 0;
+    background: transparent; border: 1px solid var(--line-2); color: var(--ivory); font-size: 12.5px;
+    transition: border-color .2s ease, background .15s ease;
+  }
+  .btn-ghost:hover { border-color: rgba(201,169,97,0.5); background: rgba(236,229,216,0.04); }
+
+  .sec-title { font-family: var(--serif); font-size: 16px; margin-bottom: 14px; display: flex; align-items: center; gap: 10px; }
+  .sec-title .ln { flex: 1; height: 1px; background: var(--line); }
+
+  /* 队列卡片 */
+  .queue { display: flex; flex-direction: column; gap: 10px; }
+  .q {
+    display: flex; align-items: center; gap: 14px; padding: 13px 16px; border-radius: 13px;
+    background: var(--panel); border: 1px solid var(--line); transition: border-color .2s ease;
+  }
+  .q .thumb {
+    width: 40px; height: 48px; border-radius: 7px; flex-shrink: 0;
+    background: linear-gradient(160deg, #2a241b, #15120e); border: 1px solid var(--line-2);
+    display: flex; align-items: center; justify-content: center; color: var(--gold); font-size: 10px;
+  }
+  .q .meta { flex: 1; min-width: 0; }
+  .q .ttl { font-size: 13.5px; color: var(--ivory); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .q .src { font-size: 11px; color: var(--muted); margin-top: 3px; }
+  .q .tag { font-size: 10px; color: var(--gold-2); border: 1px solid rgba(201,169,97,0.4); padding: 2px 8px; border-radius: 999px; margin-left: 8px; }
+  .q .st { font-size: 11.5px; color: var(--muted); width: 74px; text-align: right; flex-shrink: 0; }
+  .q .st.done { color: #8fd6a0; }
+  .q .bar { width: 90px; height: 4px; border-radius: 3px; background: var(--line-2); overflow: hidden; flex-shrink: 0; }
+  .q .bar i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, var(--gold), var(--gold-2)); transition: width .3s ease; }
+
+  /* 曲库视图 */
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 16px; }
+  .card {
+    border-radius: 14px; overflow: hidden; background: var(--panel); border: 1px solid var(--line);
+    transition: transform .2s ease, border-color .2s ease;
+  }
+  .card:hover { transform: translateY(-3px); border-color: rgba(201,169,97,0.5); }
+  .card .cover { aspect-ratio: 3/4; background: linear-gradient(160deg, #2a241b, #14110d); display: flex; align-items: center; justify-content: center; color: var(--gold); font-family: var(--serif); font-size: 13px; }
+  .card .cap { padding: 10px 12px; }
+  .card .cap .n { font-size: 12.5px; color: var(--ivory); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .card .cap .a { font-size: 10.5px; color: var(--muted); margin-top: 2px; }
+
+  /* 设置视图 */
+  .set-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; max-width: 720px; }
+  .set {
+    border-radius: 14px; padding: 18px; background: var(--panel); border: 1px solid var(--line);
+  }
+  .set h4 { font-family: var(--serif); font-size: 15px; margin-bottom: 14px; color: var(--ivory); }
+  .set .row { display: flex; align-items: center; justify-content: space-between; padding: 9px 0; border-bottom: 1px solid var(--line); }
+  .set .row:last-child { border-bottom: none; }
+  .set .row .k { font-size: 12.5px; color: var(--muted); }
+  .set .row .v { font-size: 13px; color: var(--ivory); font-family: var(--serif-en); }
+  .toggle { width: 40px; height: 22px; border-radius: 999px; background: rgba(201,169,97,0.6); position: relative; cursor: pointer; }
+  .toggle::after { content: ""; position: absolute; right: 3px; top: 3px; width: 16px; height: 16px; border-radius: 50%; background: #20180a; }
+
+  .statusbar {
+    height: 34px; flex-shrink: 0; display: flex; align-items: center; justify-content: space-between;
+    padding: 0 20px; background: var(--ink-2); color: var(--muted); font-size: 11px;
+    border-top: 1px solid var(--line);
+  }
+  .statusbar .dot { width: 7px; height: 7px; border-radius: 50%; background: #8fd6a0; display: inline-block; margin-right: 6px; }
+
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<div class="win" id="win">
+  <div class="app">
+    <!-- 左侧导航 -->
+    <div class="sidebar">
+      <div class="brand">
+        <svg class="violin" viewBox="0 0 24 24" fill="none" stroke="#c9a961" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M9 3l3 2 3-2M12 5v3M8 8c0 4 2 5 4 5s4-1 4-5M12 13v5M9 21l3-3 3 3"/>
+          <path d="M9.5 9.5h5M9.5 11h5" opacity="0.5"/>
+        </svg>
+        <div>
+          <div class="name">Score<b>·</b>Studio</div>
+          <div class="sub">曲谱工坊</div>
+        </div>
+      </div>
+      <div class="nav-title">ATELIER</div>
+      <div class="nav-item active" data-view="process"><span class="ic">⌘</span> 处理台</div>
+      <div class="nav-item" data-view="library"><span class="ic">♪</span> 曲库</div>
+      <div class="nav-item" data-view="settings"><span class="ic">⚙</span> 设置</div>
+      <div class="foot">古典 · 巴洛克<br/>主题外壳 v0.1<br/><span style="color:var(--gold)">锚点：无边框高级感</span></div>
+    </div>
+
+    <!-- 主区 -->
+    <div class="main">
+      <div class="topbar">
+        <div class="crumb">处理台 <span class="gold">/</span> <span id="crumbSub">提取与标准</span></div>
+        <div class="top-right">
+          <div class="pill" id="themePill">主题来源标注 · 开</div>
+          <div class="ctrls">
+            <button class="btn min" title="最小化"><svg viewBox="0 0 15 15"><rect x="2.5" y="6.6" width="10" height="1.6" rx="0.8" fill="currentColor"/></svg></button>
+            <button class="btn max" title="最大化"><svg viewBox="0 0 15 15"><rect x="3" y="3" width="9" height="9" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></button>
+            <button class="btn close" title="关闭"><svg viewBox="0 0 15 15"><path d="M3.6 3.6l7.8 7.8M11.4 3.6l-7.8 7.8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 处理台视图 -->
+      <div class="view" id="view-process">
+        <div class="hero-h">将散落的曲谱，皈依为统一形制</div>
+        <div class="hero-p">粘贴微信公众号 / 弹琴吧 / 人人文档 / 抖音图文链接，或拖入本地图片与 PDF。<b>提取 → 透明转白底 → LANCZOS 缩放至 2009px → 300DPI·95 PDF</b>，输出至你指定的目录。</div>
+
+        <div class="field-label">SOURCE · 来源链接</div>
+        <div class="input-row">
+          <input class="input" id="linkInput" placeholder="https://mp.weixin.qq.com/s/...  或  tan8.com / 抖音图文 ..." />
+          <button class="btn-gold" id="addBtn">收入队列</button>
+        </div>
+
+        <div class="field-label">DROP · 拖拽或点选本地文件</div>
+        <div class="drop" id="drop">
+          <div class="big">将曲谱图片 / 文件夹拖入此处</div>
+          <div>支持 PNG · JPEG · 本地 PDF（自动重处理为统一形制）</div>
+        </div>
+
+        <div class="field-label">OUTPUT · 输出目录</div>
+        <div class="dir-row">
+          <div class="dir-box" id="dirBox">G:\Lin_File\Documents\曲谱</div>
+          <button class="btn-ghost" id="dirBtn">选择目录</button>
+        </div>
+
+        <div class="sec-title">队列 <span class="ln"></span></div>
+        <div class="queue" id="queue"></div>
+        <div style="margin-top:18px; display:flex; gap:12px;">
+          <button class="btn-gold" id="runBtn">开始处理</button>
+          <button class="btn-ghost" id="demoBtn">载入示例队列</button>
+        </div>
+      </div>
+
+      <!-- 曲库视图 -->
+      <div class="view hidden" id="view-library">
+        <div class="hero-h">已皈依的形制</div>
+        <div class="hero-p">统一 2009px 宽 · 300DPI · 白底 PDF，归档于此。</div>
+        <div class="grid" id="libGrid"></div>
+      </div>
+
+      <!-- 设置视图 -->
+      <div class="view hidden" id="view-settings">
+        <div class="hero-h">工坊形制</div>
+        <div class="hero-p">默认值已按你的标准预设，一般无需改动。</div>
+        <div class="set-grid">
+          <div class="set">
+            <h4>处理参数</h4>
+            <div class="row"><span class="k">目标宽度</span><span class="v">2009 px</span></div>
+            <div class="row"><span class="k">缩放算法</span><span class="v">LANCZOS</span></div>
+            <div class="row"><span class="k">输出分辨率</span><span class="v">300 DPI</span></div>
+            <div class="row"><span class="k">PDF 质量</span><span class="v">95</span></div>
+            <div class="row"><span class="k">透明底→白底</span><span class="v">开</span></div>
+          </div>
+          <div class="set">
+            <h4>命名与题注</h4>
+            <div class="row"><span class="k">文件名规则</span><span class="v" style="font-family:var(--sans);font-size:11px;">曲名-歌手-主题来源</span></div>
+            <div class="row"><span class="k">主题来源标注</span><div class="toggle" id="themeToggle"></div></div>
+            <div class="row"><span class="k">忽略微信发送</span><span class="v">开</span></div>
+            <div class="row"><span class="k">外壳主题</span><span class="v">巴洛克</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="statusbar">
+        <span><span class="dot"></span><span id="statText">就绪 · 待收入链接</span></span>
+        <span>Score Studio · 锚定无边框高级感</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  // 视图切换
+  const crumbSub = document.getElementById('crumbSub');
+  document.querySelectorAll('.nav-item').forEach(n => {
+    n.addEventListener('click', () => {
+      document.querySelectorAll('.nav-item').forEach(x => x.classList.remove('active'));
+      n.classList.add('active');
+      const v = n.dataset.view;
+      ['process','library','settings'].forEach(id => {
+        document.getElementById('view-'+id).classList.toggle('hidden', id !== v);
+      });
+      crumbSub.textContent = v==='process' ? '提取与标准' : v==='library' ? '已归档曲谱' : '工坊形制';
+    });
+  });
+
+  // 队列
+  const queue = document.getElementById('queue');
+  const dirBox = document.getElementById('dirBox');
+  const statText = document.getElementById('statText');
+  const samples = [
+    { t:'【八仙】全世界的雨', s:'周深、Ella陈嘉桦', src:'微信公众号', theme:'揉揉酱自制' },
+    { t:'顽疾', s:'薛之谦', src:'弹琴吧', theme:'' },
+    { t:'Sing For You', s:'EXO', src:'ktvc8.com', theme:'游戏主题曲' },
+    { t:'千本樱', s:'初音未来-Lindsey Stirling', src:'本地PDF', theme:'动漫' },
+  ];
+  function addItem(t, s, src, theme) {
+    const el = document.createElement('div');
+    el.className = 'q';
+    el.innerHTML = `
+      <div class="thumb">谱</div>
+      <div class="meta">
+        <div class="ttl">${t}${theme?`<span class="tag">${theme}</span>`:''}</div>
+        <div class="src">${s} · 来源 ${src}</div>
+      </div>
+      <div class="st">待处理</div>
+      <div class="bar"><i></i></div>`;
+    queue.appendChild(el);
+    statText.textContent = `队列中 ${queue.children.length} 项`;
+  }
+  document.getElementById('addBtn').addEventListener('click', () => {
+    const v = document.getElementById('linkInput').value.trim();
+    if (!v) return;
+    addItem('来自链接的曲谱', '解析中…', '链接', '');
+    document.getElementById('linkInput').value = '';
+  });
+  document.getElementById('demoBtn').addEventListener('click', () => {
+    samples.forEach(s => addItem(s.t, s.s, s.src, s.theme));
+  });
+
+  // 拖拽
+  const drop = document.getElementById('drop');
+  ;['dragover','dragenter'].forEach(e => drop.addEventListener(e, ev => { ev.preventDefault(); drop.classList.add('hover'); }));
+  ;['dragleave','drop'].forEach(e => drop.addEventListener(e, ev => { ev.preventDefault(); drop.classList.remove('hover'); }));
+  drop.addEventListener('drop', ev => {
+    const files = ev.dataTransfer.files;
+    for (const f of files) addItem(f.name.replace(/\.[^.]+$/,''), '本地文件', '拖入', '');
+  });
+  drop.addEventListener('click', () => addItem('选中的本地曲谱', '本地文件', '点选', ''));
+
+  // 目录选择（模拟）
+  document.getElementById('dirBtn').addEventListener('click', () => {
+    const picks = ['G:\\Lin_File\\Documents\\曲谱', 'D:\\Music\\小提琴谱', 'G:\\Lin_File\\Documents\\曲谱\\归档'];
+    const next = picks[(picks.indexOf(dirBox.textContent) + 1) % picks.length];
+    dirBox.textContent = next;
+    statText.textContent = '输出目录：' + next;
+  });
+
+  // 主题来源标注开关
+  const toggle = document.getElementById('themeToggle');
+  const themePill = document.getElementById('themePill');
+  toggle.addEventListener('click', () => {
+    const on = toggle.style.background.includes('20180a') || toggle.style.background === '';
+    toggle.style.background = on ? 'rgba(143,214,160,0.6)' : 'rgba(201,169,97,0.6)';
+    toggle.style.setProperty('--x','');
+    themePill.textContent = '主题来源标注 · ' + (on ? '关' : '开');
+  });
+
+  // 处理（前端模拟，真实接入后端 Python 管线）
+  document.getElementById('runBtn').addEventListener('click', () => {
+    if (!queue.children.length) { statText.textContent = '队列为空，请先收入链接'; return; }
+    [...queue.children].forEach((el, i) => {
+      const st = el.querySelector('.st'); const bar = el.querySelector('.bar i');
+      setTimeout(() => {
+        st.textContent = '处理中'; st.style.color = 'var(--gold-2)';
+        let p = 0; const iv = setInterval(() => {
+          p += 8 + Math.random()*12; if (p >= 100) { p = 100; clearInterval(iv);
+            st.textContent = '已完成'; st.classList.add('done');
+            statText.textContent = `已完成 ${i+1}/${queue.children.length}`;
+          }
+          bar.style.width = p + '%';
+        }, 160);
+      }, i * 300);
+    });
+  });
+
+  // 曲库示例
+  const lib = document.getElementById('libGrid');
+  const libItems = [
+    ['全世界的雨','周深、Ella'],['顽疾','薛之谦'],['Sing For You','EXO'],
+    ['千本樱','初音未来'],['Black Paradise','BEAST'],['不染','毛不易'],
+    ['梦中的婚礼','小提琴版'],['菊次郎的夏天','久石让']
+  ];
+  libItems.forEach(([n,a]) => {
+    const c = document.createElement('div'); c.className = 'card';
+    c.innerHTML = `<div class="cover">谱</div><div class="cap"><div class="n">${n}</div><div class="a">${a}</div></div>`;
+    lib.appendChild(c);
+  });
+</script>
+</body>
+</html>
