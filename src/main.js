@@ -10,6 +10,10 @@ if (IS_TAURI) document.body.classList.add('tauri');
 if (!IS_TAURI) document.body.classList.add('appmode');
 
 const $ = (id) => document.getElementById(id);
+// HTML 转义：凡拼入 innerHTML 的动态值（PDF 首页文字 / 网络返回的专辑/歌手等）必须先过 esc，
+// 封堵恶意 PDF 或联网内容注入脚本（XSS）。
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g,
+  (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const crumbSub = $('crumbSub');
 const queueEl = $('queue');
 const dirBox = $('dirBox');
@@ -224,13 +228,6 @@ $('dirBtn').onclick = async () => {
   // 正在曲库/巡检视图时，切换目录后立即按新目录刷新
   if (!$('view-library').classList.contains('hidden')) loadLibrary();
   if (!$('view-inspect').classList.contains('hidden')) loadInspect();
-};
-
-// ============ 主题来源标注开关 ============
-$('themeToggle').onclick = () => {
-  themeOn = !themeOn;
-  $('themeToggle').style.background = themeOn ? 'rgba(201,169,97,0.6)' : 'rgba(143,214,160,0.6)';
-  $('themePill').textContent = '主题来源标注 · ' + (themeOn ? '开' : '关');
 };
 
 // ============ 后端调用 ============
@@ -555,13 +552,13 @@ function renderLibrary(items) {
     c.dataset.name = rel;
     // 占位封面（真实缩略图由懒加载填充）
     const cover = '<div class="cover">谱</div>';
-    const themeChip = it.album ? `<span class="theme-chip">${it.album}</span>` : '';
+    const themeChip = it.album ? `<span class="theme-chip">${esc(it.album)}</span>` : '';
     const meta = `<div class="meta-row"><span>${it.pages || '?'} 页</span><span>${fmtBytes(it.size)}</span></div>`;
     c.innerHTML = `
       <div class="cover-wrap" data-name="${rel}">${cover}<div class="cover-overlay"><span class="open-hint">打开 PDF</span></div></div>
       <div class="cap">
-        <div class="n">${it.title || it.name.replace(/\.pdf$/i, '')}</div>
-        <div class="a">${it.artist || '古典'} ${themeChip}</div>
+        <div class="n">${esc(it.title || it.name.replace(/\.pdf$/i, ''))}</div>
+        <div class="a">${esc(it.artist) || '古典'} ${themeChip}</div>
         ${meta}
       </div>`;
     c.addEventListener('click', () => openPdf(rel));
@@ -639,21 +636,21 @@ function renderInspect() {
   inspRows.forEach((r, i) => {
     const checked = inspSelected.has(i) ? 'checked' : '';
     const curParts = [];
-    if (r.cur_album) curParts.push('专·' + r.cur_album);
-    const cur = `<b>${r.cur_title || '?'}</b><br><span class="sub">${r.cur_artist || '未知歌手'}${curParts.length ? ' · ' + curParts.join(' · ') : ''}</span>`;
+    if (r.cur_album) curParts.push('专·' + esc(r.cur_album));
+    const cur = `<b>${esc(r.cur_title) || '?'}</b><br><span class="sub">${esc(r.cur_artist) || '未知歌手'}${curParts.length ? ' · ' + curParts.join(' · ') : ''}</span>`;
     const det = r.has_text
-      ? `<span class="ok">✓ 文字</span> <b>${r.det_title || '—'}</b> / ${r.det_artist || '—'}`
+      ? `<span class="ok">✓ 文字</span> <b>${esc(r.det_title) || '—'}</b> / ${esc(r.det_artist) || '—'}`
       : '<span class="warn">扫描件/无文字</span>';
-    const excerpt = `<div class="excerpt" title="${(r.text_excerpt || '').replace(/"/g, '&quot;')}">${r.text_excerpt || '—'}</div>`;
+    const excerpt = `<div class="excerpt" title="${esc(r.text_excerpt || '—')}">${esc(r.text_excerpt) || '—'}</div>`;
     const album = r.sug_album
-      ? `<span class="theme-chip" title="来源：${r.meta_album ? 'PDF元数据' : (r.cur_album ? '文件名' : '识别')}">${r.sug_album}</span>${r.sug_category ? `<span class="cat-chip">${r.sug_category}</span>` : ''}`
+      ? `<span class="theme-chip" title="来源：${r.meta_album ? 'PDF元数据' : (r.cur_album ? '文件名' : '识别')}">${esc(r.sug_album)}</span>${r.sug_category ? `<span class="cat-chip">${esc(r.sug_category)}</span>` : ''}`
       : '<span class="muted">未定</span>';
     const rowClass = r.needs_rename ? 'needs' : 'ok';
     html += `
       <div class="insp-row ${rowClass}" data-idx="${i}">
-        <div class="cell-name" title="${r.name}">${r.name}</div>
+        <div class="cell-name" title="${esc(r.name)}">${esc(r.name)}</div>
         <div class="cell-cur">${cur}<br>${det}${excerpt}</div>
-        <div class="cell-sug" title="${r.suggested}">${r.suggested}</div>
+        <div class="cell-sug" title="${esc(r.suggested)}">${esc(r.suggested)}</div>
         <div class="cell-album" data-album-idx="${i}">${album}</div>
         <div class="cell-check"><input type="checkbox" ${checked} ${!r.needs_rename ? 'disabled' : ''}></div>
       </div>`;

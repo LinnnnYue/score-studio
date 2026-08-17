@@ -40,5 +40,3 @@
 由 **小凛酱丷** 独立开发与维护。
 - 项目主页：[GitHub 仓库](https://github.com/linnnnnnnnnnnnnnnnnnnnn/score-studio)
 - 反馈与建议：欢迎在仓库提交 Issue
-
-> 署名非「Workbuddy」等任何 AI 助手 —— 由 小凛酱丷 个人创作。

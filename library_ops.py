@@ -948,6 +948,20 @@ def _itunes_album(q: str, timeout: float = 3, title_hint: str = '',
     return best
 
 
+def _wiki_search(query: str, api: str, timeout: float = 3) -> dict:
+    """按 MediaWiki 搜索 API 取结果（仅用于分类兜底，不臆造专辑名）。
+
+    此前该函数缺失，导致 _wiki_category 调用处抛 NameError 被外层 except 吞掉、
+    Wikipedia 兜底分支静默失效。此处补上真实实现：失败/异常由调用方兜底。
+    """
+    params = {'action': 'query', 'list': 'search', 'srsearch': query,
+              'format': 'json', 'utf8': 1, 'srlimit': 3}
+    url = api + '?' + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={'User-Agent': UA})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode('utf-8', 'ignore'))
+
+
 def _wiki_category(q: str, timeout: float = 3):
     """联网取分类(动画/游戏/电影/影视) 仅作兜底标签；不臆造专辑名。"""
     for api in (WIKI_ZH, WIKI_EN):

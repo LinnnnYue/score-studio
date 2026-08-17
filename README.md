@@ -2,7 +2,7 @@
 
 将散落的曲谱皈依为统一形制：**提取（多源链接 / 本地）→ 透明底转白底 → LANCZOS 缩放至 2009px 宽 → 300DPI·95 PDF → 输出至自定义目录**。
 
-外壳主题：**古典 · 巴洛克 & 教堂**，无边框高级感 Flutter 风窗口（锚定基线，见 `ui-design-director` skill）。
+外壳主题：**古典 · 巴洛克 & 教堂**，无边框高级感 Flutter 风窗口（风格为自研基线）。
 
 ---
 
@@ -13,13 +13,13 @@
 1. **处理（Process）**：从多源链接 / 本地文件提取曲谱，统一为 2009px·300DPI·白底 PDF（核心管道）。
 2. **曲库（Library）**：浏览输出目录中的 PDF 曲谱墙。
    - **真实封面**：用 PyMuPDF 渲染 PDF 首页缩略图（按 `basename+size+mtime` 缓存）。
-   - **三向模糊搜索**：曲名 + 歌手 + 主题标签任意组合关键词即时过滤（吸顶工具栏 + 歌手筛选 chips）。
+   - **关键词搜索**：曲名 / 歌手 / 专辑任意组合关键词即时过滤。
    - **点击开 PDF**：卡片点击直接调用系统默认程序打开对应 PDF（Tauri 走 `open_path`，本地走 `/api/file` 下载）。
    - **深色滚动条**：与首页一致的全局滚动条风格。
-3. **巡检（Inspect · 命名规范化）**：统一「曲名[-歌手][-主题]」文件名结构。
+3. **巡检（Inspect · 命名规范化）**：统一「曲名[-歌手][-专辑]」文件名结构。
    - 数字 PDF：用 PyMuPDF 抽首页文字补名；扫描件：回退仅解析文件名 + 标记待人工补名。
-   - **预览优先、绝不静默改**：先展示预览表（当前名 / 解析 / 文字摘要 / 建议名 / 主题标签 / 采纳勾选）→ 勾选 → 点执行 → `confirm()` 二次确认 → 才真正重命名（不可逆操作红线）。
-   - **联网主题标签（可选增强）**：Wikipedia 免费无密钥 Action API 识别主题曲 / 影视 / 动漫 / 游戏归属并加标签；离线时优雅降级为仅本地识别，不阻塞主流程。
+   - **预览优先、绝不静默改**：先展示预览表（当前文件名 / 解析结果 / 建议新名 / 专辑 / 采纳勾选）→ 勾选 → 点执行 → `confirm()` 二次确认 → 才真正重命名（不可逆操作红线）。
+   - **联网补全专辑（可选增强）**：iTunes 取证真实专辑 + 本地中文来源作品兜底，离线时优雅降级为仅本地识别，不阻塞主流程。
 4. **设置（Settings）**：主题与运行偏好。
 
 > 全部前端逻辑（`src/main.js`）自动判别 Tauri / 本地服务器两种后端，单一代码源同时服务两种运行时。
@@ -28,8 +28,8 @@
 
 ```
 score-studio/
-├─ sheet_pipeline.py      # 后端管道（曲谱标准化，复用「曲谱处理 v4.0」）
-├─ library_ops.py         # 曲库/巡检后端（缩略图/命名解析/inspect/wiki_tag/rename）
+├─ sheet_pipeline.py      # 后端管道（曲谱标准化：缩放/白底/DPI）
+├─ library_ops.py         # 曲库/巡检后端（缩略图/命名解析/巡检/专辑补全/重命名）
 ├─ run_local.py           # 本地运行服务器（标准库，无需 Node/Rust）
 ├─ vite.config.js         # 前端构建配置（root=src，out=dist）
 ├─ package.json           # 前端依赖与脚本
@@ -44,13 +44,13 @@ score-studio/
 ├─ ui-prototype.html      # 设计稿（独立单文件可视化原型，可双击直接看效果）
 ├─ score-studio-launch-proof.png  # 真·无边框窗口首启截图证据
 ├─ 启动曲谱工坊.bat       # 一键启动（ASCII 编码，自动配置 Python 环境）
-   └─ src-tauri/             # Tauri v2 工程（无边框窗体 + Rust 命令桥接 Python）
-   ├─ tauri.conf.json     # decorations:false + transparent:false + shadow:false
-   ├─ Cargo.toml
-   ├─ build.rs
-   ├─ src/main.rs         # process_scores / list_library / open_path / get_library / inspect_library / rename_items / wiki_tag 命令 + Python 自动探测
-   ├─ capabilities/default.json
-   └─ icons/              # 编译期生成的图标全套（png/ico/icns）
+├─ src-tauri/             # Tauri v2 工程（无边框窗体 + Rust 命令桥接 Python）
+│  ├─ tauri.conf.json     # decorations:false + transparent:false + shadow:false
+│  ├─ Cargo.toml
+│  ├─ build.rs
+│  ├─ src/main.rs         # process_scores / list_library / open_path / get_library / inspect_library / rename_items / album_tag / album_tag_batch 命令 + Python 自动探测
+│  ├─ capabilities/default.json
+│  └─ icons/              # 编译期生成的图标全套（png/ico/icns）
 ```
 
 ---
@@ -110,7 +110,7 @@ src-tauri\target\release\score-studio.exe
 结果：
 - `.win` 走默认样式：`width:1020px; height:680px; max-width:96vw; max-height:94vh; border-radius:20px`（居中卡片）
 - `body` 背景是 `radial-gradient`（深色，边缘 #0e0c09）
-- 圆角 UI 卡片浮在中央，四角外露出 body 深色背景 → 主上看到的「方角黑框框起圆角界面」
+- 圆角 UI 卡片浮在中央，四角外露出 body 深色背景 → 呈现「方角黑框框起圆角界面」
 
 **修复**（`src/main.js`）：
 ```javascript
@@ -125,7 +125,7 @@ if (!IS_TAURI) document.body.classList.add('appmode');
 1. **v5-v6 误判**：以为是 WebView2 transparent 窗口 22px inset → 改为 `transparent:false + backgroundColor:#16130e`。方向对了一半，但不是真因。
 2. **v8-v9 误判**：以为是 WebView2 controller bounds 未同步 → 引入 `webview2-com` + `windows` crate 做 `SetBounds`。实际上多余的 Rust 介入会干扰 wry 的 frontendDist 加载。
 3. **v9 中间真相**：`tauri.conf.json` 的 `devUrl` 字段会让 release exe navigate 到 localhost，导致错误页 + 黑框。已删除 `devUrl` / `beforeDevCommand` / `beforeBuildCommand`，只保留 `frontendDist: "../dist"`。
-4. **v11 二次误判**：以为是 `.win` 圆角外 webview 背景色差 → 改同色后我自以为好了，但主上实际仍有黑框。
+4. **v11 二次误判**：以为是 `.win` 圆角外 webview 背景色差 → 改同色后自认为已修复，但实测仍有黑框。
 5. **v12 真因**：`body.tauri` 类缺失。此类错误极隐蔽：本地测试或某些路径下 `.win` 恰好铺满，容易让诊断人误以为 CSS 已生效。
 6. **v13 透明窗圆角未遂**：尝试 `transparent:true + backgroundColor:#00000000 + body 透明 + border-radius` 让圆角外透桌面。在部分 WebView2/GPU 组合上透明不生效，仍显直角黑底，故弃用。
 7. **v14 最终方案**：Rust 侧 `SetWindowRgn` 直接把窗体裁剪为圆角矩形，不依赖 WebView2 透明，与 CSS `border-radius:16px` 对齐。截图见 `score-studio-rounded-proof.png`。
@@ -181,7 +181,7 @@ Rust 命令 `process_scores` 通过 `std::process::Command` 调用 `sheet_pipeli
 | 输出分辨率 | 300 DPI |
 | PDF 质量 | 95（无损封装等效） |
 | 透明底→白底 | 开 |
-| 文件名规则 | 曲名-歌手-主题来源 |
+| 文件名规则 | 曲名-歌手-专辑 |
 
 ## 支持来源
 - 微信公众号（`mp.weixin.qq.com`，提取 `mmbiz` 高清图）
@@ -189,3 +189,5 @@ Rust 命令 `process_scores` 通过 `std::process::Command` 调用 `sheet_pipeli
 - 通用网页（尺寸/体积筛选）
 - 本地图片文件夹 / 本地 PDF（重处理为统一形制）
 - 抖音图文等（走通用提取，后续可补专用规则）
+
+> 使用预览与支持作者：见 [docs/SUPPORT.md](docs/SUPPORT.md)（界面实拍 / 微信收款 / 爱发电）。
