@@ -394,61 +394,71 @@ struct ProcessResult {
 
 /// 调用 Python 曲谱管道（sheet_pipeline.py）。
 /// Python 路径与脚本路径可由环境变量覆盖（便于打包时指向内嵌 sidecar）。
+/// async：PDF 处理在后台线程执行，主线程不阻塞 → 根治 Windows「窗口未响应/泛白/转圈」。
 #[tauri::command]
-fn process_scores(
+async fn process_scores(
     app: tauri::AppHandle,
     input: String,
     output_dir: String,
     theme: String,
     name: String,
 ) -> ProcessResult {
-    let python = resolve_python(&app);
-    let script = resolve_pipeline(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        let python = resolve_python(&app);
+        let script = resolve_pipeline(&app);
 
-    let mut cmd = Command::new(&python);
-    hide_console(&mut cmd);
-    if python == "py" {
-        cmd.arg("-3");
-    }
-    cmd.arg(&script)
-        .arg("--input")
-        .arg(&input)
-        .arg("--output-dir")
-        .arg(&output_dir);
-    if !theme.is_empty() {
-        cmd.arg("--theme").arg(&theme);
-    }
-    if !name.is_empty() {
-        cmd.arg("--name").arg(&name);
-    }
-
-    match run_child_timeout(&mut cmd, None) {
-        Ok((status, out, err)) => {
-            let combined = format!("{}{}", out, err);
-            let ok = status.success() && combined.contains("✅");
-            let path = if ok {
-                combined
-                    .split("✅ PDF 已生成：")
-                    .nth(1)
-                    .and_then(|s| s.lines().next())
-                    .map(|s| s.trim().to_string())
-            } else {
-                None
-            };
-            ProcessResult {
-                ok,
-                path,
-                log: out,
-                error: if ok { None } else { Some(combined.trim().to_string()) },
-            }
+        let mut cmd = Command::new(&python);
+        hide_console(&mut cmd);
+        if python == "py" {
+            cmd.arg("-3");
         }
-        Err(e) => ProcessResult {
-            ok: false,
-            path: None,
-            log: String::new(),
-            error: Some(e.message),
-        },
-    }
+        cmd.arg(&script)
+            .arg("--input")
+            .arg(&input)
+            .arg("--output-dir")
+            .arg(&output_dir);
+        if !theme.is_empty() {
+            cmd.arg("--theme").arg(&theme);
+        }
+        if !name.is_empty() {
+            cmd.arg("--name").arg(&name);
+        }
+
+        match run_child_timeout(&mut cmd, None) {
+            Ok((status, out, err)) => {
+                let combined = format!("{}{}", out, err);
+                let ok = status.success() && combined.contains("✅");
+                let path = if ok {
+                    combined
+                        .split("✅ PDF 已生成：")
+                        .nth(1)
+                        .and_then(|s| s.lines().next())
+                        .map(|s| s.trim().to_string())
+                } else {
+                    None
+                };
+                ProcessResult {
+                    ok,
+                    path,
+                    log: out,
+                    error: if ok { None } else { Some(combined.trim().to_string()) },
+                }
+            }
+            Err(e) => ProcessResult {
+                ok: false,
+                path: None,
+                log: String::new(),
+                error: Some(e.message),
+            },
+        }
+    })
+    .await
+    .unwrap_or(ProcessResult {
+        ok: false,
+        path: None,
+        log: String::new(),
+        error: Some("后台任务调度失败".to_string()),
+    })
 }
 
 /// 列出输出目录中的 PDF（曲库视图）。
@@ -479,71 +489,122 @@ fn open_path(path: String) {
 /// 获取曲库元数据（轻量索引：含页数/大小/解析字段，不含缩略图 base64）。
 /// 返回 PyResult{ok, out(JSON), error, code, stderr}——失败/空结果时前端可见 stderr，杜绝静默空。
 #[tauri::command]
-fn get_library(app: tauri::AppHandle, dir: String) -> PyResult {
-    let script = resolve_library_ops(&app);
-    let dir = dir.trim().to_string();
-    run_python_full(&app, &script, &["meta", "--dir", &dir])
+async fn get_library(app: tauri::AppHandle, dir: String) -> PyResult {
+    tauri::async_runtime::spawn_blocking(move || {
+        let script = resolve_library_ops(&app);
+        let dir = dir.trim().to_string();
+        run_python_full(&app, &script, &["meta", "--dir", &dir])
+    })
+    .await
+    .unwrap_or(PyResult {
+        ok: false,
+        out: String::new(),
+        error: Some("后台任务调度失败".to_string()),
+        code: -1,
+        stderr: None,
+    })
 }
 
 /// 按需获取单个 PDF 首页缩略图 base64（懒加载，命中文件缓存直接返回）。返回 base64 文本。
+/// async：后台线程渲染，主线程不阻塞。
 #[tauri::command]
-fn get_thumb(app: tauri::AppHandle, dir: String, name: String) -> String {
-    let script = resolve_library_ops(&app);
-    let dir = dir.trim().to_string();
-    let name = name.trim().to_string();
-    // 用 --key=value 等号形式：rel 可能以 '-' 开头（如 '-1.pdf'），避免 argparse 误判为选项
-    let args = [format!("thumb"), format!("--dir={}", dir), format!("--name={}", name)];
-    let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    run_python_json(&app, &script, &refs)
+async fn get_thumb(app: tauri::AppHandle, dir: String, name: String) -> String {
+    tauri::async_runtime::spawn_blocking(move || {
+        let script = resolve_library_ops(&app);
+        let dir = dir.trim().to_string();
+        let name = name.trim().to_string();
+        // 用 --key=value 等号形式：rel 可能以 '-' 开头（如 '-1.pdf'），避免 argparse 误判为选项
+        let args = [format!("thumb"), format!("--dir={}", dir), format!("--name={}", name)];
+        let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        run_python_json(&app, &script, &refs)
+    })
+    .await
+    .unwrap_or_default()
 }
 
 /// 批量缩略图：一次 Python 进程渲染多张（滚动加载性能关键，杜绝逐张启进程闪窗口）。
 /// rels 为 JSON 数组字符串，如 '["a.pdf","b.pdf"]'。返回 PyResult{ok, out({rel:b64}), ...}。
+/// async：后台线程渲染多张，主线程不阻塞。
 #[tauri::command]
-fn get_thumbs_batch(app: tauri::AppHandle, dir: String, rels: String) -> PyResult {
-    let script = resolve_library_ops(&app);
-    let dir = dir.trim().to_string();
-    let rels = rels.trim().to_string();
-    let args = [format!("thumb_batch"), format!("--dir={}", dir), format!("--rels={}", rels)];
-    let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    run_python_full(&app, &script, &refs)
+async fn get_thumbs_batch(app: tauri::AppHandle, dir: String, rels: String) -> PyResult {
+    tauri::async_runtime::spawn_blocking(move || {
+        let script = resolve_library_ops(&app);
+        let dir = dir.trim().to_string();
+        let rels = rels.trim().to_string();
+        let args = [format!("thumb_batch"), format!("--dir={}", dir), format!("--rels={}", rels)];
+        let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        run_python_full(&app, &script, &refs)
+    })
+    .await
+    .unwrap_or(PyResult {
+        ok: false,
+        out: String::new(),
+        error: Some("后台任务调度失败".to_string()),
+        code: -1,
+        stderr: None,
+    })
 }
 
 /// 扫描曲库并给出命名规范化建议。返回 PyResult{ok, out(JSON), error, code, stderr}。
+/// async：Python 子进程在后台线程执行，主线程不阻塞 → 根治 Windows「窗口未响应/泛白/转圈」。
 #[tauri::command]
-fn inspect_library(app: tauri::AppHandle, dir: String) -> PyResult {
-    let script = resolve_library_ops(&app);
-    let dir = dir.trim().to_string();
-    run_python_full(&app, &script, &["inspect", "--dir", &dir])
+async fn inspect_library(app: tauri::AppHandle, dir: String) -> PyResult {
+    tauri::async_runtime::spawn_blocking(move || {
+        let script = resolve_library_ops(&app);
+        let dir = dir.trim().to_string();
+        run_python_full(&app, &script, &["inspect", "--dir", &dir])
+    })
+    .await
+    .unwrap_or(PyResult {
+        ok: false,
+        out: String::new(),
+        error: Some("后台任务调度失败".to_string()),
+        code: -1,
+        stderr: None,
+    })
 }
 
 /// 执行批量重命名（仅在前端预览确认后调用）。payload 为 JSON 字符串。
+/// async：后台线程执行。
 #[tauri::command]
-fn rename_items(app: tauri::AppHandle, dir: String, payload: String) -> String {
-    let script = resolve_library_ops(&app);
-    let dir = dir.trim().to_string();
-    run_python_json(&app, &script, &["rename", "--dir", &dir, "--payload", &payload])
+async fn rename_items(app: tauri::AppHandle, dir: String, payload: String) -> String {
+    tauri::async_runtime::spawn_blocking(move || {
+        let script = resolve_library_ops(&app);
+        let dir = dir.trim().to_string();
+        run_python_json(&app, &script, &["rename", "--dir", &dir, "--payload", &payload])
+    })
+    .await
+    .unwrap_or_else(|_| "{\"error\":\"后台任务调度失败\"}".into())
 }
 
 /// 联网补全歌曲的真实专辑归属（iTunes 优先，Wikipedia/本地词库兜底）。返回 JSON 文本。
 /// 用 run_python_full：失败时 stderr/退出码随结果回传，前端显形真实原因（杜绝「不可用」哑弹）。
+/// async：后台线程联网，主线程不阻塞。
 #[tauri::command]
-fn album_tag(app: tauri::AppHandle, title: String, artist: String) -> String {
-    let script = resolve_library_ops(&app);
-    let title = title.trim().to_string();
-    let artist = artist.trim().to_string();
-    let res = run_python_full(&app, &script, &["albumtag", "--title", &title, "--artist", &artist]);
-    serde_json::to_string(&res).unwrap_or_else(|_| "{\"ok\":false,\"error\":\"序列化失败\"}".into())
+async fn album_tag(app: tauri::AppHandle, title: String, artist: String) -> String {
+    tauri::async_runtime::spawn_blocking(move || {
+        let script = resolve_library_ops(&app);
+        let title = title.trim().to_string();
+        let artist = artist.trim().to_string();
+        let res = run_python_full(&app, &script, &["albumtag", "--title", &title, "--artist", &artist]);
+        serde_json::to_string(&res).unwrap_or_else(|_| "{\"ok\":false,\"error\":\"序列化失败\"}".into())
+    })
+    .await
+    .unwrap_or_else(|_| "{\"ok\":false,\"error\":\"后台任务调度失败\"}".into())
 }
 
 /// 批量并发补全专辑（一次 Python 进程并发处理多首，杜绝逐首 round-trip 卡顿）。
 /// items 为 JSON 数组字符串（可能极大）——走 stdin 传参，规避 Windows 命令行 32767 上限。
-/// 返回 PyResult{ok, out, error, code, stderr}。
+/// 返回 PyResult{ok, out, error, code, stderr}。async：后台线程执行，主线程不阻塞。
 #[tauri::command]
-fn album_tag_batch(app: tauri::AppHandle, items: String) -> String {
-    let script = resolve_library_ops(&app);
-    let res = run_python_full_stdin(&app, &script, &["albumbatch"], &items);
-    serde_json::to_string(&res).unwrap_or_else(|_| "{\"ok\":false,\"error\":\"序列化失败\"}".into())
+async fn album_tag_batch(app: tauri::AppHandle, items: String) -> String {
+    tauri::async_runtime::spawn_blocking(move || {
+        let script = resolve_library_ops(&app);
+        let res = run_python_full_stdin(&app, &script, &["albumbatch"], &items);
+        serde_json::to_string(&res).unwrap_or_else(|_| "{\"ok\":false,\"error\":\"序列化失败\"}".into())
+    })
+    .await
+    .unwrap_or_else(|_| "{\"ok\":false,\"error\":\"后台任务调度失败\"}".into())
 }
 
 
