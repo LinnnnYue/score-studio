@@ -21,11 +21,33 @@ fn hide_console(_cmd: &mut Command) {}
 /// 1) 环境变量 SCORE_PYTHON（调试/覆盖，信任用户）
 /// 2) 打包内嵌 python_dist/python.exe —— 校验 import fitz/PIL/numpy 通过才用；
 ///    历史坏包（目录被压平缺 PIL）自动跳过，避免「假可用」导致 ModuleNotFoundError
-/// 3) 系统已装 Python（py -3 / python / python3）—— 同样校验三件套
+/// 3) 系统已装 Python（py -3 / python / python3）—— 同样校验三件套；
+///    跳过 WindowsApps 的「商店假 python stub」（重定向器，启动即 9009）
 /// 4) 兜底 "python"（前端显形诊断）
 fn resolve_python(app: &tauri::AppHandle) -> String {
     static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    CACHE.get_or_init(|| resolve_python_uncached(app)).clone()
+    let p = CACHE.get_or_init(|| resolve_python_uncached(app)).clone();
+    if p == "python" {
+        // 兜底命中：记录诊断，供 spawn 失败时前端显形真实原因
+        set_py_diag("未找到可用的 Python 运行时（内置 python_dist 校验失败，系统探测亦无可用解释器，已跳过 Windows 商店假 stub）");
+    }
+    p
+}
+
+/// 全局 Python 探测诊断（进程内最后一次解析的说明），spawn 失败时拼进错误消息。
+static PY_DIAG: std::sync::OnceLock<std::sync::Mutex<String>> = std::sync::OnceLock::new();
+fn set_py_diag(msg: &str) {
+    let m = PY_DIAG.get_or_init(|| std::sync::Mutex::new(String::new()));
+    if let Ok(mut g) = m.lock() {
+        *g = msg.to_string();
+    }
+}
+fn get_py_diag() -> String {
+    PY_DIAG
+        .get()
+        .and_then(|m| m.lock().ok())
+        .map(|g| g.clone())
+        .unwrap_or_default()
 }
 
 fn python_ready(cmd: &mut Command) -> bool {
@@ -37,20 +59,37 @@ fn python_ready(cmd: &mut Command) -> bool {
     }
 }
 
+/// 是否为 Windows 商店「假 python stub」：位于 WindowsApps 目录的可执行文件，
+/// 实际是重定向到商店的 AppInstallerPythonRedirector.exe，启动必失败/退出码 9009。
+fn is_windowsapps_stub(path: &std::path::Path) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(s) = path.to_str() {
+            let lower = s.to_lowercase();
+            if lower.contains("windowsapps") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn resolve_python_uncached(app: &tauri::AppHandle) -> String {
     if let Ok(p) = env::var("SCORE_PYTHON") {
         if !p.trim().is_empty() {
             return p;
         }
     }
+    // ① 内嵌 python_dist：exe 同级优先（NSIS 版 python_dist 在 $INSTDIR\python_dist），
+    //    resource_dir 兜底（未来若改用 tauri resources 打包）
     let mut bundled: Vec<std::path::PathBuf> = Vec::new();
-    if let Ok(res) = app.path().resource_dir() {
-        bundled.push(res.join("python_dist").join("python.exe"));
-    }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             bundled.push(dir.join("python_dist").join("python.exe"));
         }
+    }
+    if let Ok(res) = app.path().resource_dir() {
+        bundled.push(res.join("python_dist").join("python.exe"));
     }
     for p in bundled {
         if p.exists() {
@@ -60,18 +99,26 @@ fn resolve_python_uncached(app: &tauri::AppHandle) -> String {
             }
         }
     }
+    // ② 系统已装 Python：跳过 WindowsApps 假 stub；校验三件套通过才用
     let candidates: [(&str, &[&str]); 3] =
         [("py", &["-3"]), ("python", &[]), ("python3", &[])];
     for (c, pre) in candidates {
-        let mut cmd = Command::new(c);
-        cmd.args(pre);
-        if python_ready(&mut cmd) {
-            // 解析真实解释器绝对路径（py launcher → C:\...\python.exe），
-            // 直连真实 python.exe 以彻底绕开 launcher 的 stdin/stdout 转发层（排查 0/888 关键）
-            if let Some(real) = real_python_path(c, pre) {
+        // 先解析候选命令的真实绝对路径（如 `py -3` → C:\Python314\python.exe），
+        // 以判定并跳过 WindowsApps stub
+        if let Some(real) = real_python_path(c, pre) {
+            if is_windowsapps_stub(std::path::Path::new(&real)) {
+                continue; // 商店假 stub，跳过
+            }
+            let mut cmd = Command::new(&real);
+            if python_ready(&mut cmd) {
                 return real;
             }
-            return c.to_string();
+        } else {
+            let mut cmd = Command::new(c);
+            cmd.args(pre);
+            if python_ready(&mut cmd) {
+                return c.to_string();
+            }
         }
     }
     "python".to_string()
@@ -175,7 +222,15 @@ fn run_child_timeout(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| RunErr { code: -1, message: e.to_string() })?;
+        .map_err(|e| {
+            let diag = get_py_diag();
+            let msg = if diag.is_empty() {
+                format!("子进程启动失败（退出码 9009）：{}", e)
+            } else {
+                format!("子进程启动失败（退出码 9009）：{}. {}", diag, e)
+            };
+            RunErr { code: 9009, message: msg }
+        })?;
 
     // 需要 stdin 时先写入并关闭（Python 侧 `sys.stdin.read()` 读光，当前用法不会死锁）。
     if let (Some(text), Some(mut si)) = (input, child.stdin.take()) {
