@@ -384,7 +384,7 @@ fn process_scores(
                 ok,
                 path,
                 log: out,
-                error: if ok { None } else { Some(err) },
+                error: if ok { None } else { Some(combined.trim().to_string()) },
             }
         }
         Err(e) => ProcessResult {

@@ -416,7 +416,11 @@ $('runBtn').onclick = async () => {
         logBox.textContent += `✓ ${res.path}\n${res.log || ''}\n`;
       } else {
         st.textContent = '失败'; st.classList.add('err'); st.classList.remove('done');
-        logBox.textContent += `✗ ${res && res.error ? res.error : '未知错误'}\n${res && res.log ? res.log : ''}\n`;
+        // 真实原因优先：stderr（error）→ stdout 里的失败提示（log）→ 兜底「未知错误」
+        const errMsg = (res && res.error && res.error.trim())
+          ? res.error.trim()
+          : ((res && res.log && res.log.trim()) ? res.log.trim() : '未知错误（无后端诊断）');
+        logBox.textContent += `✗ ${errMsg}\n`;
         if (res && res.error && res.error.includes('无法自动命名')) {
           statText.textContent = '页面无标题，请双击该曲目名称补名后重试';
         }
