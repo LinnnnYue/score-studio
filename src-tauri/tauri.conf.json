@@ -32,6 +32,11 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
+    "windows": {
+      "nsis": {
+        "installMode": "perMachine"
+      }
+    },
     "resources": {
       "../sheet_pipeline.py": "sheet_pipeline.py",
       "../library_ops.py": "library_ops.py"

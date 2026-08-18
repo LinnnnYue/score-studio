@@ -230,6 +230,40 @@ $('dirBtn').onclick = async () => {
   if (!$('view-inspect').classList.contains('hidden')) loadInspect();
 };
 
+// ============ 首次启动引导（选择曲谱目录，仅第一次） ============
+// 无 localStorage 记录 = 首次启动 → 弹出引导层强制选目录；选完存 localStorage，此后不再弹。
+(function initFirstRun() {
+  const overlay = $('setupOverlay');
+  if (!overlay) return;
+  let hasDir = false;
+  try { hasDir = !!localStorage.getItem(DIR_KEY); } catch (_) {}
+  if (hasDir) return; // 已配置过，直接进入
+
+  overlay.classList.remove('hidden');
+  const setupDirBox = $('setupDirBox');
+  const setupDirBtn = $('setupDirBtn');
+  const setupConfirm = $('setupConfirm');
+
+  const pickSetupDir = async () => {
+    if (IS_TAURI) {
+      const { open } = await import('@tauri-apps/plugin-dialog');
+      const r = await open({ directory: true, defaultPath: setupDirBox.textContent });
+      if (r) setupDirBox.textContent = r;
+    }
+  };
+  setupDirBtn.onclick = pickSetupDir;
+  setupDirBox.onclick = pickSetupDir;
+
+  setupConfirm.onclick = () => {
+    const chosen = setupDirBox.textContent.trim();
+    if (!chosen) return;
+    dirBox.textContent = chosen;
+    saveDir();
+    overlay.classList.add('hidden');
+    statText.textContent = '输出目录：' + chosen;
+  };
+})();
+
 // ============ 后端调用 ============
 // 安全解析：后端异常时可能返回空串，直接 JSON.parse 会崩；此处兜底返回 null。
 function safeParse(s) {

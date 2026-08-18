@@ -66,6 +66,22 @@
           <button class="btn-ghost" id="dirBtn">选择目录</button>
         </div>
 
+        <!-- 首次启动引导：选择曲谱目录（仅第一次，选完持久化不再弹） -->
+        <div class="setup-overlay hidden" id="setupOverlay">
+          <div class="setup-card">
+            <div class="setup-title">欢迎使用 Score Studio · 曲谱工坊</div>
+            <div class="setup-sub">第一步：请选择你的曲谱存放目录（输出 PDF 会存到这里）</div>
+            <div class="dir-row">
+              <div class="dir-box" id="setupDirBox">G:\Lin_File\Documents\曲谱</div>
+              <button class="btn-ghost" id="setupDirBtn">浏览…</button>
+            </div>
+            <div class="setup-hint">之后可在「设置」或处理台随时更改。</div>
+            <div style="margin-top:18px; text-align:center;">
+              <button class="btn-gold" id="setupConfirm">确认并开始</button>
+            </div>
+          </div>
+        </div>
+
         <div class="sec-title">队列 <span class="ln"></span></div>
         <div class="queue" id="queue"></div>
         <div style="margin-top:18px; display:flex; gap:12px; flex-wrap:wrap;">
