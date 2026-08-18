@@ -265,6 +265,8 @@ $('dirBtn').onclick = async () => {
 })();
 
 // ============ 后端调用 ============
+// 让出渲染循环：长 await 任务前调用，使「扫描中/补全中」等状态能及时绘制，避免 UI 假死感
+const yieldToUI = () => new Promise((resolve) => setTimeout(resolve, 0));
 // 安全解析：后端异常时可能返回空串，直接 JSON.parse 会崩；此处兜底返回 null。
 function safeParse(s) {
   if (typeof s !== 'string') return s;
@@ -753,6 +755,8 @@ async function loadInspect() {
   inspSelected.clear();
   inspUpdated.clear();
   updateApplyButton();
+  // 关键：让渲染循环先画「扫描中…」，避免长 await 期间假死
+  await yieldToUI();
   try {
     const raw = await callInspectLibrary(dirBox.textContent);
     inspRows = raw.items;
@@ -790,15 +794,17 @@ $('albumAllBtn').addEventListener('click', async () => {
     return;
   }
   inspUpdated.clear();
-  statText.textContent = `正在联网补全专辑（分批 ${targets.length} 项，实时更新进度）…`;
+  statText.textContent = `正在联网补全专辑（共 ${targets.length} 项，实时更新进度）…`;
   const total = targets.length;
-  const BATCH = 60;
+  const BATCH = 30; // 收紧批大小，每批网络往返更短，UI 喘息更频繁（根治「多次未响应卡顿」）
   let changed = 0;
   let localHit = 0;
   for (let off = 0; off < total; off += BATCH) {
     const chunk = targets.slice(off, off + BATCH);
     const items = chunk.map((c) => ({ title: c.r.sug_title, artist: c.r.sug_artist || '' }));
-    statText.textContent = `正在联网补全专辑（${Math.min(off + BATCH, total)}/${total} 项，实时更新）…`;
+    await yieldToUI(); // 让渲染循环刷新进度文字，避免长 await 期间界面假死
+    const pct = Math.round((Math.min(off + BATCH, total) / total) * 100);
+    statText.textContent = `正在联网补全专辑 ${Math.min(off + BATCH, total)}/${total}（${pct}%）…`;
     let r = null;
     try {
       r = await callAlbumTagBatch(items);
@@ -807,6 +813,7 @@ $('albumAllBtn').addEventListener('click', async () => {
       renderInspect();
       return;
     }
+    await yieldToUI();
     const tags = r ? r.tags : [];
     const backendStderr = r ? r.stderr || '' : '';
     if (!tags || !Array.isArray(tags)) {

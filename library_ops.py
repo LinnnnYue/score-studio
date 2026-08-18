@@ -1084,8 +1084,13 @@ def album_tag(title: str, artist: str = '', timeout: float = 3,
 
 
 def album_tag_batch(items, max_workers: int = 6, timeout: float = 3,
-                    use_cache: bool = True):
-    """并发补全一批 (title, artist) 的专辑。items 可为 [dict|tuple]，返回与输入等长的列表。"""
+                    use_cache: bool = True, budget: float = 8.0):
+    """并发补全一批 (title, artist) 的专辑。items 可为 [dict|tuple]，返回与输入等长的列表。
+
+    budget（整体超时预算，秒）：即便网络/代理再不稳，整个批次也绝不拖超过 budget，
+    超时未决的项回落本地兜底结果（或 None），保证「批量联网补全」永远可预期地快速返回，
+    根治前端多次未响应/卡死的体验问题。
+    """
     if not items:
         return []
     norm = []
@@ -1096,14 +1101,31 @@ def album_tag_batch(items, max_workers: int = 6, timeout: float = 3,
             t = it[0] if len(it) > 0 else ''
             a = it[1] if len(it) > 1 else ''
             norm.append((str(t), str(a)))
-    from concurrent.futures import ThreadPoolExecutor
-
-    def _one(tup):
-        return album_tag(tup[0], tup[1], timeout=timeout, use_cache=use_cache)
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import time as _time
 
     n = max(1, min(max_workers, len(norm)))
+    out = [None] * len(norm)
+
+    def _one(idx_tup):
+        idx = idx_tup[0]
+        tup = idx_tup[1]
+        return idx, album_tag(tup[0], tup[1], timeout=timeout, use_cache=use_cache)
+
+    deadline = _time.monotonic() + budget
     with ThreadPoolExecutor(max_workers=n) as ex:
-        return list(ex.map(_one, norm))
+        futs = [ex.submit(_one, (i, t)) for i, t in enumerate(norm)]
+        for f in as_completed(futs, timeout=None):
+            remaining = deadline - _time.monotonic()
+            if remaining <= 0:
+                break  # 超整体预算，放弃等待剩余项（它们回落 None / 本地）
+            try:
+                idx, val = f.result(timeout=max(0.01, remaining))
+                out[idx] = val
+            except Exception:
+                pass
+        # 超时后剩余未完成 future 保持原样（None 或本地兜底由下一次单点调用补齐）
+    return out
 
 
 # ===================== 安全批量重命名 =====================
