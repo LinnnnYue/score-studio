@@ -372,7 +372,30 @@ body.tauri .win, body.appmode .win {
 .cell-cur .ok { color: #8fd6a0; }
 .cell-cur .warn { color: #e3c789; }
 .cell-sug { color: var(--gold-2); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.cell-album { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cell-album { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: text; }
+.cell-album .theme-chip { cursor: pointer; }
+/* 专辑手填：双击进入输入框，融入巴洛克气泡样式 */
+.album-input {
+  width: 100%; padding: 4px 8px; border-radius: 999px;
+  background: rgba(201,169,97,0.10); border: 1px solid rgba(201,169,97,0.5);
+  color: var(--gold-2); font-size: 10.5px; font-family: var(--sans);
+  outline: none;
+}
+.album-input:focus { border-color: var(--gold); }
+/* 专辑可编辑的铅笔提示（悬停行时显现） */
+.cell-album .album-edit {
+  display: inline-block; margin-left: 6px; color: var(--muted);
+  font-size: 11px; opacity: 0; transition: opacity .15s ease-out;
+}
+.insp-row:hover .cell-album .album-edit { opacity: 1; }
+/* 本次联网补全新增专辑的行高亮 */
+.insp-row.updated { background: rgba(201,169,97,0.08); }
+.insp-row.updated .cell-name { color: var(--ivory); }
+.updated-tag {
+  display: inline-block; margin-left: 5px; padding: 1px 6px; border-radius: 8px;
+  font-size: 9.5px; color: #20180a; background: var(--gold); font-weight: 700;
+  vertical-align: 1px;
+}
 .cell-arr { color: var(--muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .cat-chip {
   display: inline-block; margin-left: 4px; padding: 1px 6px; border-radius: 8px;

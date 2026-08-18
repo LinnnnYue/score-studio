@@ -38,5 +38,5 @@
 ## 关于作者
 
 由 **小凛酱丷** 独立开发与维护。
-- 项目主页：[GitHub 仓库](https://github.com/linnnnnnnnnnnnnnnnnnnnn/score-studio)
+- 项目主页：[GitHub 仓库](https://github.com/LinnnnYue/score-studio)
 - 反馈与建议：欢迎在仓库提交 Issue

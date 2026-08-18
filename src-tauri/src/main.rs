@@ -1,8 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::env;
-use std::io::Write;
-use std::process::{Command, Stdio};
+use std::io::{Read, Write};
+use std::process::{Child, Command, Stdio};
 
 use serde::Serialize;
 use tauri::Manager;
@@ -152,6 +152,84 @@ fn resolve_library_ops(app: &tauri::AppHandle) -> String {
     "library_ops.py".to_string()
 }
 
+/// 子进程异常结果：code -1 = 启动失败，-2 = 执行超时（已强制终止）。
+struct RunErr {
+    code: i32,
+    message: String,
+}
+
+/// 子进程超时阈值（看门狗）：网络半开 / 畸形输入 / 引擎挂起时，超时即 kill。
+const PROC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// spawn + 带超时的进程执行（标准库实现，无新增依赖）：
+/// - stdout / stderr 交由独立线程收集，主线程每 50ms 轮询 `try_wait()`；
+/// - 超过 PROC_TIMEOUT 仍未退出 → `child.kill()` 并返回超时错误；
+/// - 正常退出 → 返回 `(ExitStatus, stdout, stderr)`。
+/// 避免 `cmd.output()` 阻塞等待导致「处理中」永久卡死。
+fn run_child_timeout(
+    cmd: &mut Command,
+    input: Option<&str>,
+) -> Result<(std::process::ExitStatus, String, String), RunErr> {
+    let mut child: Child = cmd
+        .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| RunErr { code: -1, message: e.to_string() })?;
+
+    // 需要 stdin 时先写入并关闭（Python 侧 `sys.stdin.read()` 读光，当前用法不会死锁）。
+    if let (Some(text), Some(mut si)) = (input, child.stdin.take()) {
+        let _ = si.write_all(text.as_bytes());
+        let _ = si.flush();
+        // si 在此析构关闭 stdin → Python 读到 EOF
+    }
+
+    let out_pipe = child.stdout.take().expect("stdout pipe");
+    let err_pipe = child.stderr.take().expect("stderr pipe");
+    let out_handle = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = read_to_end_lossy(out_pipe, &mut buf);
+        buf
+    });
+    let err_handle = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = read_to_end_lossy(err_pipe, &mut buf);
+        buf
+    });
+
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) => {
+                if start.elapsed() >= PROC_TIMEOUT {
+                    let _ = child.kill();
+                    let _ = child.wait(); // 回收进程；随后读取线程读至 EOF 自然结束
+                    let _ = out_handle.join();
+                    let _ = err_handle.join();
+                    return Err(RunErr {
+                        code: -2,
+                        message: "子进程执行超时（120s），已强制终止".to_string(),
+                    });
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => return Err(RunErr { code: -1, message: e.to_string() }),
+        }
+    };
+    let out = out_handle.join().unwrap_or_default();
+    let err = err_handle.join().unwrap_or_default();
+    Ok((status, out, err))
+}
+
+/// 把管道读到底并转成 UTF-8 损失字符串（与 `String::from_utf8_lossy` 语义一致）。
+fn read_to_end_lossy(mut pipe: impl Read, buf: &mut String) -> std::io::Result<()> {
+    let mut bytes = Vec::new();
+    pipe.read_to_end(&mut bytes)?;
+    buf.push_str(&String::from_utf8_lossy(&bytes));
+    Ok(())
+}
+
 /// 调用 Python 脚本并返回 stdout 中的 JSON 文本（用于 library_ops）。
 fn run_python_json(app: &tauri::AppHandle, script: &str, args: &[&str]) -> String {
     let python = resolve_python(app);
@@ -164,12 +242,9 @@ fn run_python_json(app: &tauri::AppHandle, script: &str, args: &[&str]) -> Strin
     for a in args {
         cmd.arg(a);
     }
-    match cmd.output() {
-        Ok(o) => {
-            let out = String::from_utf8_lossy(&o.stdout).to_string();
-            out.trim().to_string()
-        }
-        Err(e) => format!("{{\"error\":\"{}\"}}", e),
+    match run_child_timeout(&mut cmd, None) {
+        Ok((_status, out, _err)) => out.trim().to_string(),
+        Err(e) => format!("{{\"error\":\"{}\"}}", e.message),
     }
 }
 
@@ -197,32 +272,10 @@ fn run_python_full_stdin(app: &tauri::AppHandle, script: &str, args: &[&str], in
     for a in args {
         cmd.arg(a);
     }
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            return PyResult {
-                ok: false,
-                out: String::new(),
-                error: Some(e.to_string()),
-                code: -1,
-                stderr: None,
-            }
-        }
-    };
-    if let Some(mut si) = child.stdin.take() {
-        let _ = si.write_all(input.as_bytes());
-        let _ = si.flush();
-        // si 在此析构关闭 stdin → Python 读到 EOF
-    }
-    match child.wait_with_output() {
-        Ok(o) => {
-            let out = String::from_utf8_lossy(&o.stdout).to_string();
-            let err = String::from_utf8_lossy(&o.stderr).to_string();
-            let code = o.status.code().unwrap_or(-1);
-            let ok = o.status.success() && !out.trim().is_empty();
+    match run_child_timeout(&mut cmd, Some(input)) {
+        Ok((status, out, err)) => {
+            let code = status.code().unwrap_or(-1);
+            let ok = status.success() && !out.trim().is_empty();
             let err_trim = err.trim().to_string();
             PyResult {
                 ok,
@@ -235,8 +288,8 @@ fn run_python_full_stdin(app: &tauri::AppHandle, script: &str, args: &[&str], in
         Err(e) => PyResult {
             ok: false,
             out: String::new(),
-            error: Some(e.to_string()),
-            code: -1,
+            error: Some(e.message),
+            code: e.code,
             stderr: None,
         },
     }
@@ -253,12 +306,10 @@ fn run_python_full(app: &tauri::AppHandle, script: &str, args: &[&str]) -> PyRes
     for a in args {
         cmd.arg(a);
     }
-    match cmd.output() {
-        Ok(o) => {
-            let out = String::from_utf8_lossy(&o.stdout).to_string();
-            let err = String::from_utf8_lossy(&o.stderr).to_string();
-            let code = o.status.code().unwrap_or(-1);
-            let ok = o.status.success() && !out.trim().is_empty();
+    match run_child_timeout(&mut cmd, None) {
+        Ok((status, out, err)) => {
+            let code = status.code().unwrap_or(-1);
+            let ok = status.success() && !out.trim().is_empty();
             let err_trim = err.trim().to_string();
             PyResult {
                 ok,
@@ -271,8 +322,8 @@ fn run_python_full(app: &tauri::AppHandle, script: &str, args: &[&str]) -> PyRes
         Err(e) => PyResult {
             ok: false,
             out: String::new(),
-            error: Some(e.to_string()),
-            code: -1,
+            error: Some(e.message),
+            code: e.code,
             stderr: None,
         },
     }
@@ -316,12 +367,10 @@ fn process_scores(
         cmd.arg("--name").arg(&name);
     }
 
-    match cmd.output() {
-        Ok(o) => {
-            let out = String::from_utf8_lossy(&o.stdout).to_string();
-            let err = String::from_utf8_lossy(&o.stderr).to_string();
+    match run_child_timeout(&mut cmd, None) {
+        Ok((status, out, err)) => {
             let combined = format!("{}{}", out, err);
-            let ok = o.status.success() && combined.contains("✅");
+            let ok = status.success() && combined.contains("✅");
             let path = if ok {
                 combined
                     .split("✅ PDF 已生成：")
@@ -342,7 +391,7 @@ fn process_scores(
             ok: false,
             path: None,
             log: String::new(),
-            error: Some(e.to_string()),
+            error: Some(e.message),
         },
     }
 }

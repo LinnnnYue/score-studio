@@ -234,7 +234,6 @@
       <div class="topbar">
         <div class="crumb">处理台 <span class="gold">/</span> <span id="crumbSub">提取与标准</span></div>
         <div class="top-right">
-          <div class="pill" id="themePill">主题来源标注 · 开</div>
           <div class="ctrls">
             <button class="btn min" title="最小化"><svg viewBox="0 0 15 15"><rect x="2.5" y="6.6" width="10" height="1.6" rx="0.8" fill="currentColor"/></svg></button>
             <button class="btn max" title="最大化"><svg viewBox="0 0 15 15"><rect x="3" y="3" width="9" height="9" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></button>
@@ -296,8 +295,7 @@
           </div>
           <div class="set">
             <h4>命名与题注</h4>
-            <div class="row"><span class="k">文件名规则</span><span class="v" style="font-family:var(--sans);font-size:11px;">曲名-歌手-主题来源</span></div>
-            <div class="row"><span class="k">主题来源标注</span><div class="toggle" id="themeToggle"></div></div>
+            <div class="row"><span class="k">文件名规则</span><span class="v" style="font-family:var(--sans);font-size:11px;">曲名-歌手-专辑</span></div>
             <div class="row"><span class="k">忽略微信发送</span><span class="v">开</span></div>
             <div class="row"><span class="k">外壳主题</span><span class="v">巴洛克</span></div>
           </div>
@@ -377,16 +375,6 @@
     const next = picks[(picks.indexOf(dirBox.textContent) + 1) % picks.length];
     dirBox.textContent = next;
     statText.textContent = '输出目录：' + next;
-  });
-
-  // 主题来源标注开关
-  const toggle = document.getElementById('themeToggle');
-  const themePill = document.getElementById('themePill');
-  toggle.addEventListener('click', () => {
-    const on = toggle.style.background.includes('20180a') || toggle.style.background === '';
-    toggle.style.background = on ? 'rgba(143,214,160,0.6)' : 'rgba(201,169,97,0.6)';
-    toggle.style.setProperty('--x','');
-    themePill.textContent = '主题来源标注 · ' + (on ? '关' : '开');
   });
 
   // 处理（前端模拟，真实接入后端 Python 管线）

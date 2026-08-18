@@ -278,7 +278,7 @@ def parse_title_fields(title: str):
 
 
 def derive_name(input_str: str, html_text: str = "", theme: str = "", custom: str = ""):
-    """文件名：曲名[-歌手][-主题来源].pdf
+    """文件名：曲名[-歌手][-标签].pdf
     优先级：custom > 页面标题解析 > 本地路径 basename。
     网页无标题且未提供 custom → 抛 ValueError（拒绝用链接 ID 冒充曲名）。"""
     if custom:
@@ -412,7 +412,7 @@ def main():
     ap = argparse.ArgumentParser(description="Score Studio 曲谱处理管道")
     ap.add_argument("--input", help="链接 / 本地图片文件夹 / 本地 PDF")
     ap.add_argument("--output-dir", default=r"G:\Lin_File\Documents\曲谱")
-    ap.add_argument("--theme", default="", help="主题来源标注，如：游戏主题曲 / 动漫")
+    ap.add_argument("--theme", default="", help="追加到文件名的额外标签（可选）")
     ap.add_argument("--name", default="", help="自定义文件名（不含扩展名）")
     ap.add_argument("--selftest", action="store_true", help="运行冒烟测试")
     args = ap.parse_args()

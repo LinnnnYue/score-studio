@@ -252,16 +252,6 @@ async function callProcess(payload) {
   return await r.json();
 }
 
-async function callLibrary(dir) {
-  if (IS_TAURI) {
-    const { invoke } = await import('@tauri-apps/api/core');
-    return await invoke('list_library', { dir });
-  }
-  const r = await fetch('/api/library?dir=' + encodeURIComponent(dir));
-  const j = await r.json();
-  return j.items || [];
-}
-
 async function callLibraryMeta(dir) {
   if (IS_TAURI) {
     const { invoke } = await import('@tauri-apps/api/core');
@@ -604,6 +594,49 @@ $('libSearch').addEventListener('input', filterLibrary);
 // ============ 巡检 ============
 let inspRows = [];
 let inspSelected = new Set();
+let inspUpdated = new Set(); // 本次「联网补全专辑」实际新增的行索引 → 表格高亮反馈
+
+// 专辑改动后按「曲名 - 歌手 - 专辑」规则实时重算建议名
+function recalcSuggested(r) {
+  const segs = [r.sug_title, r.sug_artist, r.sug_album].filter((s) => s && s.trim());
+  r.suggested = segs.join('-') + '.pdf';
+  r.needs_rename = true;
+}
+
+// 专辑列内联编辑：双击进入输入框，回车/失焦提交并实时重算建议名
+function startAlbumEdit(cell) {
+  if (cell.querySelector('.album-input')) return; // 已在编辑中
+  const idx = Number(cell.dataset.albumIdx);
+  const r = inspRows[idx];
+  if (!r) return;
+  cell.innerHTML = `<input class="album-input" maxlength="80" value="${esc(r.sug_album || '')}">`;
+  const inp = cell.querySelector('.album-input');
+  inp.dataset.idx = idx;
+  inp.focus();
+  inp.select();
+  inp.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter') { ev.preventDefault(); commitAlbumEdit(inp); }
+    else if (ev.key === 'Escape') { ev.preventDefault(); renderInspect(); }
+  });
+  inp.addEventListener('blur', () => commitAlbumEdit(inp));
+  inp.addEventListener('click', (ev) => ev.stopPropagation());
+}
+
+function commitAlbumEdit(inp) {
+  if (!inp || inp._done) return;
+  inp._done = true;
+  const idx = Number(inp.dataset.idx);
+  const r = inspRows[idx];
+  const text = inp.value.replace(/\s+/g, ' ').trim();
+  if (r && text !== (r.sug_album || '')) {
+    r.sug_album = text;
+    recalcSuggested(r);
+    inspUpdated.delete(idx);
+    inspSelected.delete(idx); // 清掉旧采纳态，避免带着旧名误改
+    statText.textContent = '专辑已改「' + (text || '已清空') + '」→ 建议名已同步更新';
+  }
+  renderInspect();
+}
 
 // rel 可能含子目录前缀；改名必须保留原目录，否则会把文件挪到根目录
 function renamePair(r) {
@@ -631,7 +664,7 @@ function renderInspect() {
     wrap.innerHTML = '<div class="hero-p">点击「扫描曲库」开始巡检。</div>';
     return;
   }
-  let html = '<div class="insp-head"><span>当前文件名</span><span>解析结果</span><span>建议新名</span><span>专辑</span><span>采纳</span></div>';
+  let html = '<div class="insp-head"><span>当前文件名</span><span>解析结果</span><span>建议新名</span><span>专辑（双击改）</span><span>采纳</span></div>';
   html += '<div class="insp-list">';
   inspRows.forEach((r, i) => {
     const checked = inspSelected.has(i) ? 'checked' : '';
@@ -642,10 +675,12 @@ function renderInspect() {
       ? `<span class="ok">✓ 文字</span> <b>${esc(r.det_title) || '—'}</b> / ${esc(r.det_artist) || '—'}`
       : '<span class="warn">扫描件/无文字</span>';
     const excerpt = `<div class="excerpt" title="${esc(r.text_excerpt || '—')}">${esc(r.text_excerpt) || '—'}</div>`;
-    const album = r.sug_album
+    const albumInner = r.sug_album
       ? `<span class="theme-chip" title="来源：${r.meta_album ? 'PDF元数据' : (r.cur_album ? '文件名' : '识别')}">${esc(r.sug_album)}</span>${r.sug_category ? `<span class="cat-chip">${esc(r.sug_category)}</span>` : ''}`
       : '<span class="muted">未定</span>';
-    const rowClass = r.needs_rename ? 'needs' : 'ok';
+    const updTag = inspUpdated.has(i) ? '<span class="updated-tag" title="本次联网补全新增">新增</span>' : '';
+    const album = `${albumInner}${updTag}<span class="album-edit" title="双击修改专辑">✎</span>`;
+    const rowClass = `${r.needs_rename ? 'needs' : 'ok'}${inspUpdated.has(i) ? ' updated' : ''}`;
     html += `
       <div class="insp-row ${rowClass}" data-idx="${i}">
         <div class="cell-name" title="${esc(r.name)}">${esc(r.name)}</div>
@@ -668,10 +703,17 @@ function renderInspect() {
   });
 }
 
+// 专辑列双击编辑（委托到容器，仅绑定一次）
+$('inspWrap').addEventListener('dblclick', (ev) => {
+  const cell = ev.target.closest('.cell-album');
+  if (cell) startAlbumEdit(cell);
+});
+
 async function loadInspect() {
   const wrap = $('inspWrap');
   wrap.innerHTML = '<div class="hero-p">扫描中…</div>';
   inspSelected.clear();
+  inspUpdated.clear();
   updateApplyButton();
   try {
     const raw = await callInspectLibrary(dirBox.textContent);
@@ -703,11 +745,13 @@ $('selNoneBtn').addEventListener('click', () => {
 });
 
 $('albumAllBtn').addEventListener('click', async () => {
-  const targets = inspRows.filter((r) => r.sug_title);
+  // 保留原始行号，便于「本次新增」高亮
+  const targets = inspRows.map((r, i) => ({ r, i })).filter((x) => x.r.sug_title);
   if (!targets.length) {
     statText.textContent = '没有可识别的条目（请先巡检并保留曲名）';
     return;
   }
+  inspUpdated.clear();
   statText.textContent = `正在联网补全专辑（分批 ${targets.length} 项，实时更新进度）…`;
   const total = targets.length;
   const BATCH = 60;
@@ -715,7 +759,7 @@ $('albumAllBtn').addEventListener('click', async () => {
   let localHit = 0;
   for (let off = 0; off < total; off += BATCH) {
     const chunk = targets.slice(off, off + BATCH);
-    const items = chunk.map((c) => ({ title: c.sug_title, artist: c.sug_artist || '' }));
+    const items = chunk.map((c) => ({ title: c.r.sug_title, artist: c.r.sug_artist || '' }));
     statText.textContent = `正在联网补全专辑（${Math.min(off + BATCH, total)}/${total} 项，实时更新）…`;
     let r = null;
     try {
@@ -740,11 +784,11 @@ $('albumAllBtn').addEventListener('click', async () => {
     chunk.forEach((c, i) => {
       const tag = tags[i];
       if (tag && tag.album) {
-        c.sug_album = tag.album;
-        if (tag.category && !c.sug_category) c.sug_category = tag.category;
-        const segs = [c.sug_title, c.sug_artist, c.sug_album].filter((s) => s && s.trim());
-        c.suggested = segs.join('-') + '.pdf';
-        c.needs_rename = true;
+        const prev = c.r.sug_album;
+        c.r.sug_album = tag.album;
+        if (tag.category && !c.r.sug_category) c.r.sug_category = tag.category;
+        recalcSuggested(c.r);
+        if (prev !== tag.album) inspUpdated.add(c.i); // 本行专辑本次新补到 → 高亮
         changed++;
         if (tag.source === 'local') localHit++;
       }
