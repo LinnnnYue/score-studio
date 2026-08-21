@@ -43,13 +43,44 @@ ILLEGAL = r'[\\/:*?"<>|]'    # Windows 非法文件名字符
 
 # ===================== 网络 =====================
 def fetch_html(url: str, cookie: str = "") -> str:
-    """抓取网页 HTML。cookie 传 Cookie 头（词曲网 ktvc8 云锁需带验证会话）。"""
+    """抓取网页 HTML。cookie 传 Cookie 头（词曲网 ktvc8 云锁需带验证会话）。
+    编码：优先 headers 里的 charset，其次 meta，最后 GBK 兜底——中文站点（词曲网）多为 GBK，
+    按 UTF-8 硬解会乱码导致 WAF 误判/提取失败。"""
     headers = {"User-Agent": UA}
     if cookie:
         headers["Cookie"] = cookie
     req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=30) as r:
-        return r.read().decode("utf-8", errors="ignore")
+        data = r.read()
+        ctype = r.headers.get("Content-Type", "")
+    raw = data.decode("utf-8", errors="ignore")
+    # Content-Type 或 <meta charset= 声明优先
+    m = re.search(r"charset=([\w-]+)", ctype, re.I)
+    if not m:
+        m = re.search(r'<meta[^>]+charset=["\']?([\w-]+)', raw[:2000], re.I)
+    enc = m.group(1).strip().lower() if m else ""
+    if enc and enc not in ("utf-8", "utf8"):
+        try:
+            raw = data.decode(enc, errors="ignore")
+        except Exception:
+            pass
+    elif enc in ("utf-8", "utf8") or raw.count("\ufffd") > 20:
+        # UTF-8 乱码（替换符多）→ 换 GBK 兜底（常见中文站）
+        try:
+            gbk = data.decode("gbk", errors="ignore")
+            if gbk.count("\ufffd") < raw.count("\ufffd"):
+                raw = gbk
+        except Exception:
+            pass
+    else:
+        # 无声明且 UTF-8 有损 → GBK 探测
+        try:
+            gbk = data.decode("gbk", errors="ignore")
+            if gbk.count("\ufffd") < raw.count("\ufffd"):
+                raw = gbk
+        except Exception:
+            pass
+    return raw
 
 
 def is_waf_page(html: str) -> bool:
@@ -117,6 +148,34 @@ def _ktvc8_imgs(html: str):
             u = "https://www.ktvc8.com/" + u.lstrip("./")
         if u not in out:
             out.append(u)
+    return out
+
+
+def _ktvc8_probe_next(imgs: list, cookie: str = "", max_probe: int = 8) -> list:
+    """词曲网「查看剩余N张曲谱」兜底：首图 URL 末端数字连续递增探测（…496 → 497 → 498…）。
+    图片 CDN 不过滤，HEAD 200 即存在；只对以数字结尾的 uploadfiles 路径生效。"""
+    if not imgs:
+        return imgs
+    import urllib.request as _ur
+    base = imgs[0]
+    m = re.match(r"^(.*?)(\d+)(\.(?:png|jpe?g|jpg|gif))$", base, re.I)
+    if not m:
+        return imgs
+    prefix, num_str, ext = m.group(1), m.group(2), m.group(3)
+    out = list(imgs)
+    for step in range(1, max_probe + 1):
+        cand = f"{prefix}{int(num_str) + step}{ext}"
+        try:
+            req = _ur.Request(cand, headers={"User-Agent": UA})
+            if cookie:
+                req.add_header("Cookie", cookie)
+            with _ur.urlopen(req, timeout=12) as r:
+                if r.status == 200 and int(r.headers.get("Content-Length", 1000)) > 20_000:
+                    out.append(cand)
+                else:
+                    break
+        except Exception:
+            break
     return out
 
 
@@ -653,6 +712,11 @@ def run(input_str: str, output_dir: str, theme: str = "", custom: str = ""):
                 if is_waf_page(p_html):
                     break
                 imgs = _ktvc8_imgs(p_html)
+                # 兜底：JS 注入型页面（剩余页图只在浏览器端生成）→ 按首图编号递增探测
+                if len(imgs) <= 1:
+                    imgs = _ktvc8_probe_next(imgs, cookie=cookie)
+                    if len(imgs) > 1:
+                        print(f"  页 {p_url.rsplit('/', 1)[-1]}: 编号探测补齐 {len(imgs)} 张")
                 print(f"  页 {p_url.rsplit('/', 1)[-1]}: 候选 {len(imgs)} 张")
                 images.extend(process_images(imgs, is_tan8=False))
             if not images:

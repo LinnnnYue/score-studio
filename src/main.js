@@ -30,7 +30,7 @@ function saveDir() {
   try { localStorage.setItem(DIR_KEY, dirBox.textContent); } catch (_) {}
 }
 
-// ============ 网站 Cookie（词曲网 ktvc8 云锁会话，可选） ============
+// ============ 网站 Cookie（词曲网 ktvc8 云锁会话，可选；设置页 password 框，非明文） ============
 const COOKIE_KEY = 'scorestudio.cookie';
 const cookieInput = $('cookieInput');
 if (cookieInput) {
@@ -41,6 +41,13 @@ if (cookieInput) {
   cookieInput.addEventListener('change', () => {
     try { localStorage.setItem(COOKIE_KEY, cookieInput.value.trim()); } catch (_) {}
   });
+  // 显示/隐藏切换（默认非明文，点击小眼睛可临时查看）
+  const ct = $('cookieToggle');
+  if (ct) {
+    ct.onclick = () => {
+      cookieInput.type = cookieInput.type === 'password' ? 'text' : 'password';
+    };
+  }
 }
 
 let themeOn = true;

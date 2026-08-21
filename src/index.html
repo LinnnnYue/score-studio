@@ -66,13 +66,6 @@
           <button class="btn-ghost" id="dirBtn">选择目录</button>
         </div>
 
-        <div class="field-label">COOKIE · 网站 Cookie <span class="hint">（可选 · 词曲网 ktvc8 被云锁拦截时粘贴）</span></div>
-        <div class="dir-row">
-          <input type="text" id="cookieInput" class="cookie-input"
-                 placeholder="例：Hm_lvt_xxx=...; qcloud_s_u=...（浏览器 Console 或 F12 里复制）"
-                 autocomplete="off" spellcheck="false" />
-        </div>
-
         <!-- 首次启动引导：选择曲谱目录（仅第一次，选完持久化不再弹） -->
         <div class="setup-overlay hidden" id="setupOverlay">
           <div class="setup-card">
@@ -150,6 +143,18 @@
             <h4>命名与题注</h4>
             <div class="row"><span class="k">文件名规则</span><span class="v" style="font-family:var(--sans);font-size:11px;">曲名-歌手-专辑</span></div>
             <div class="row"><span class="k">外壳主题</span><span class="v">巴洛克</span></div>
+          </div>
+          <div class="set" style="grid-column: 1 / -1;">
+            <h4>网站会话 Cookie <span style="font-weight:400;font-size:11px;color:var(--muted);">（可选 · 词曲网 ktvc8 被云锁拦截时填）</span></h4>
+            <div style="margin:10px 0 6px;font-size:11px;color:var(--muted);line-height:1.6;">
+              浏览器打开词曲网页面 → F12 → 应用/Storage → Cookies → 全选复制，或安装 Cookie Editor 导出 header string；<br/>
+              粘贴后保存，处理词曲网链接时自动携带（含 security_session_verify 的正确 header 可过云锁）。
+            </div>
+            <div class="dir-row" style="margin-bottom:0;">
+              <input type="password" id="cookieInput" class="cookie-input"
+                     placeholder="security_session_verify=...; Hm_lvt_...=...; a=..." autocomplete="off" spellcheck="false" />
+              <button class="btn-ghost" id="cookieToggle" title="显示/隐藏">👁</button>
+            </div>
           </div>
         </div>
       </div>
