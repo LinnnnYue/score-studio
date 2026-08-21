@@ -25,3 +25,7 @@ __pycache__/
 *.pdb
 _repro*
 Score-Studio-Portable/
+# 本地评审/测试产物
+_review/
+_selftest_in.png
+_selftest_out/
