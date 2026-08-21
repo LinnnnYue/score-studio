@@ -4,6 +4,12 @@ target/
 node_modules/
 dist/
 
+# 例外：ccmz 渲染引擎的 dist（运行必需）与 package 锁文件
+!src-tauri/resources/ccmz-engine/dist/
+!src-tauri/resources/ccmz-engine/dist/**
+!src-tauri/resources/ccmz-engine/package.json
+!src-tauri/resources/ccmz-engine/package-lock.json
+
 # 运行时缓存
 .score-studio-cache/
 *.log
