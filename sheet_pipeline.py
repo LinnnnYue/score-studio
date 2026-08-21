@@ -92,26 +92,31 @@ def extract_tan8(html: str):
 # ===================== 词曲网（ktvc8.com） =====================
 # 谱面为位图 jpg/png，位于 .contentpic 内（uploadfiles/YYYYMMDD/xxx.png 或 uploaduserskinfiles/...）。
 # 站点挂了云锁 WAF：机器请求可能弹「网站防火墙」页 → 需带 Cookie（设置里粘贴会话）或换网络。
+# 坑：剩余页图藏在内联 JS（myFunction/show_neirong 的字符串拼接里），点击「查看剩余N张曲谱」才写入 DOM。
+#     所以提取必须从 JS 字符串里也挖 src —— 只抓 contentpic 的 img 会漏页（如《耳朵》只拿到第 1 页）。
 def _ktvc8_imgs(html: str):
-    """提取词曲网正文曲谱大图（contentpic 内优先；兜底 uploadfiles 目录大图，去重保序）。"""
-    seg = ""
+    """提取词曲网全部曲谱大图（contentpic img + 内联 JS 字符串里的剩余页 src），去重保序。"""
+    out = []
+    # 1) contentpic 内直接 img（首页序）
     m = re.search(r'class="contentpic"[^>]*>(.*?)</div>', html, re.S | re.I)
     if m:
-        seg = m.group(1)
-    candidates = [seg, html]
-    out = []
-    for s in candidates:
-        urls = re.findall(
-            r'(?:src|data-src)="([^"]*?/(?:uploadfiles|uploaduserskinfiles)/[^"]+?\.(?:png|jpe?g|jpg|gif))"',
-            s, re.I)
-        for u in urls:
+        for u in re.findall(
+                r'(?:src|data-src)="([^"]*?/(?:uploadfiles|uploaduserskinfiles)/[^"]+?\.(?:png|jpe?g|jpg|gif))"',
+                m.group(1), re.I):
             u = u.split("?")[0]
             if u.startswith(".."):
                 u = "https://www.ktvc8.com/" + u.lstrip("./")
             if u not in out:
                 out.append(u)
-        if out:
-            break
+    # 2) 全文（含内联 JS 字符串 var carname='<img src=...>' 的剩余页）
+    for u in re.findall(
+            r"['\"]([^'\"<>]*?/(?:uploadfiles|uploaduserskinfiles)/[^'\"<>]+?\.(?:png|jpe?g|jpg|gif))['\"]",
+            html, re.I):
+        u = u.split("?")[0]
+        if u.startswith(".."):
+            u = "https://www.ktvc8.com/" + u.lstrip("./")
+        if u not in out:
+            out.append(u)
     return out
 
 
@@ -398,8 +403,9 @@ def resize_standard(img):
 
 
 def is_score_candidate(img_bytes_len: int, w: int, h: int) -> bool:
-    """筛选曲谱：高度 > 800px 且体积 > 50KB 且宽高比贴近 A4（排除图标/装饰/头像/竖版封面）。"""
-    if h <= 800 or img_bytes_len <= 50_000:
+    """筛选曲谱：高度 > 800px 且体积 > 25KB 且宽高比贴近 A4（排除图标/装饰/头像/竖版封面）。
+    注：体积阈值曾用 50KB，误杀过 47KB 的正谱页（PNG 压缩率高不代表内容少）。"""
+    if h <= 800 or img_bytes_len <= 25_000:
         return False
     ratio = w / h
     # A4：竖版 0.707 / 横版 1.414，放宽邻域防轻微变形误滤
@@ -591,14 +597,36 @@ def run(input_str: str, output_dir: str, theme: str = "", custom: str = ""):
     os.makedirs(output_dir, exist_ok=True)
     is_tan8 = "tan8.com" in input_str
     html = ""
-    if input_str.lower().startswith("http"):
+    if (input_str.lower().startswith("http")
+            and re.match(r"^https?://\S+\.(?:png|jpe?g|jpg|webp)($|\?)", input_str.lower())
+            and " " not in input_str.strip()):
+        # 单张图片直链（词曲网被云锁拦时的通道：图片 CDN 不过滤，浏览器里复制图片地址即可）
+        print("[来源] 图片直链")
+        images = process_images([input_str], is_tan8=False)
+    elif " " in input_str.strip() and all(
+            re.match(r"^https?://\S+\.(?:png|jpe?g|jpg|webp)($|\?)", u.lower()) for u in input_str.split()):
+        # 多张图片直链（空格分隔一组）：全部下载合并为一份 PDF（词曲网「查看剩余」多页图通道）
+        urls = [u for u in input_str.split() if u]
+        print(f"[来源] 图片直链 ×{len(urls)}（合并为一份 PDF）")
+        images = []
+        for u in urls:
+            try:
+                images.extend(process_images([u], is_tan8=False))
+            except Exception as e:
+                print(f"  ⚠ {u.split('/')[-1]} 下载失败：{e}")
+        if not images:
+            print("⚠ 全部图片直链下载失败，退出。")
+            return None
+        if not theme and not custom:
+            custom = "曲谱合集"
+    elif input_str.lower().startswith("http"):
         ktvc8 = "ktvc8.com" in input_str.lower()
         cookie = os.environ.get("SCORE_KTVC8_COOKIE", "")
         html = fetch_html(input_str, cookie=cookie)
         if ktvc8 and is_waf_page(html):
             raise ValueError(
-                "词曲网被云锁（WAF）拦截：请在「设置」粘贴浏览器 Cookie 后重试，"
-                "或用浏览器打开该页面通过验证后再试。")
+                "词曲网被云锁（WAF）拦截：请用浏览器打开页面，右键复制曲谱图片地址，"
+                "直接粘贴到本输入框重试（图片地址不受云锁限制）。")
         # 虫虫钢琴：ccmz 完整曲谱（付费预览图绕过，取公开工程文件渲染）
         if "gangqinpu.com" in input_str.lower() and ".ccmz" in html:
             print("[来源] 虫虫钢琴（ccmz 完整版）")

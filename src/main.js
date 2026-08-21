@@ -95,9 +95,18 @@ function addItem(t, s, src, theme, input) {
 }
 
 $('addBtn').onclick = () => {
-  const v = $('linkInput').value.trim();
-  if (!v) return;
-  addItem('来自链接的曲谱', '解析中…', '链接', '', v);
+  const raw = $('linkInput').value.trim();
+  if (!raw) return;
+  // 支持多图片直链：空格/换行/逗号分隔的若干图片 URL → 合并为一组处理（词曲网被云锁拦时的通道）
+  const parts = raw.split(/[\s,，]+/).filter(Boolean);
+  const imgUrls = parts.filter((p) => /^https?:\/\/\S+\.(png|jpe?g|jpg|webp)$/i.test(p));
+  if (imgUrls.length > 1) {
+    addItem(`图片直链 ×${imgUrls.length}（合并为一份 PDF）`, '待处理', '链接', '', imgUrls.join(' '));
+    $('linkInput').value = '';
+    statText.textContent = `已收入 ${imgUrls.length} 条图片直链，将合并为一份 PDF`;
+    return;
+  }
+  addItem('来自链接的曲谱', '解析中…', '链接', '', parts.join(' '));
   $('linkInput').value = '';
 };
 $('clearBtn').onclick = () => {
