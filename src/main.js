@@ -30,6 +30,19 @@ function saveDir() {
   try { localStorage.setItem(DIR_KEY, dirBox.textContent); } catch (_) {}
 }
 
+// ============ 网站 Cookie（词曲网 ktvc8 云锁会话，可选） ============
+const COOKIE_KEY = 'scorestudio.cookie';
+const cookieInput = $('cookieInput');
+if (cookieInput) {
+  try {
+    const savedCookie = localStorage.getItem(COOKIE_KEY);
+    if (savedCookie) cookieInput.value = savedCookie;
+  } catch (_) {}
+  cookieInput.addEventListener('change', () => {
+    try { localStorage.setItem(COOKIE_KEY, cookieInput.value.trim()); } catch (_) {}
+  });
+}
+
 let themeOn = true;
 
 // ============ 视图切换 ============
@@ -445,6 +458,7 @@ $('runBtn').onclick = async () => {
         outputDir: dirBox.textContent,
         theme: themeOn ? (el.querySelector('.tag') ? el.querySelector('.tag').textContent : '') : '',
         name: customName,
+        cookie: cookieInput ? cookieInput.value.trim() : '',
       });
       if (res && res.ok) {
         st.textContent = '已完成'; st.classList.add('done'); st.classList.remove('err');

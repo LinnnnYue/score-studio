@@ -402,6 +402,7 @@ async fn process_scores(
     output_dir: String,
     theme: String,
     name: String,
+    cookie: Option<String>,
 ) -> ProcessResult {
     tauri::async_runtime::spawn_blocking(move || {
         let python = resolve_python(&app);
@@ -409,6 +410,12 @@ async fn process_scores(
 
         let mut cmd = Command::new(&python);
         hide_console(&mut cmd);
+        // 词曲网等需云锁 Cookie 的站点：经环境变量透传（避免命令行长度/转义问题）
+        if let Some(ck) = cookie {
+            if !ck.trim().is_empty() {
+                cmd.env("SCORE_KTVC8_COOKIE", ck.trim());
+            }
+        }
         if python == "py" {
             cmd.arg("-3");
         }

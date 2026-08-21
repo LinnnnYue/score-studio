@@ -165,6 +165,17 @@ body.tauri .win, body.appmode .win {
 }
 .btn-ghost:hover { border-color: rgba(201,169,97,0.5); background: rgba(236,229,216,0.04); }
 
+/* 网站 Cookie 输入框（词曲网 ktvc8 云锁会话） */
+.cookie-input {
+  flex: 1; height: 42px; border-radius: 11px; padding: 0 14px;
+  background: var(--panel); border: 1px solid var(--line-2); color: var(--ivory);
+  font-size: 12.5px; outline: none; transition: border-color .2s ease;
+  font-family: inherit;
+}
+.cookie-input:focus { border-color: rgba(201,169,97,0.55); }
+.cookie-input::placeholder { color: var(--muted); opacity: .7; }
+.field-label .hint { font-size: 11px; color: var(--muted); font-weight: 400; }
+
 /* 首次启动引导层 */
 .setup-overlay {
   position: fixed; inset: 0; z-index: 1000;

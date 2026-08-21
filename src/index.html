@@ -66,6 +66,13 @@
           <button class="btn-ghost" id="dirBtn">选择目录</button>
         </div>
 
+        <div class="field-label">COOKIE · 网站 Cookie <span class="hint">（可选 · 词曲网 ktvc8 被云锁拦截时粘贴）</span></div>
+        <div class="dir-row">
+          <input type="text" id="cookieInput" class="cookie-input"
+                 placeholder="例：Hm_lvt_xxx=...; qcloud_s_u=...（浏览器 Console 或 F12 里复制）"
+                 autocomplete="off" spellcheck="false" />
+        </div>
+
         <!-- 首次启动引导：选择曲谱目录（仅第一次，选完持久化不再弹） -->
         <div class="setup-overlay hidden" id="setupOverlay">
           <div class="setup-card">

@@ -42,11 +42,23 @@ ILLEGAL = r'[\\/:*?"<>|]'    # Windows 非法文件名字符
 
 
 # ===================== 网络 =====================
-def fetch_html(url: str) -> str:
-    """抓取网页 HTML（绕过微信 robots 限制：服务端 HTML 已含 data-src 全部图片 URL）。"""
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
+def fetch_html(url: str, cookie: str = "") -> str:
+    """抓取网页 HTML。cookie 传 Cookie 头（词曲网 ktvc8 云锁需带验证会话）。"""
+    headers = {"User-Agent": UA}
+    if cookie:
+        headers["Cookie"] = cookie
+    req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=30) as r:
         return r.read().decode("utf-8", errors="ignore")
+
+
+def is_waf_page(html: str) -> bool:
+    """检测是否撞上云锁/防火墙验证页（机器访问被拦的标志）。"""
+    if re.search(r"<title>\s*网站防火墙\s*</title>", html, re.I):
+        return True
+    if re.search(r"cloudwaf|waf\.ktvc8|验证码|滑动验证", html, re.I) and len(html) < 20000:
+        return True
+    return False
 
 
 def download_bytes(url: str) -> bytes:
@@ -75,6 +87,69 @@ def extract_tan8(html: str):
     """弹琴吧：提取隐藏的高清标准版曲谱 URL（*_standard/ 目录）。"""
     pat = re.compile(r'https://oss\.tan8\.com/yuepuku/\d+/\d+/\d+_\w+_standard/\d+_\w+\.ypad\.\d+\.png')
     return list(dict.fromkeys(pat.findall(html)))
+
+
+# ===================== 词曲网（ktvc8.com） =====================
+# 谱面为位图 jpg/png，位于 .contentpic 内（uploadfiles/YYYYMMDD/xxx.png 或 uploaduserskinfiles/...）。
+# 站点挂了云锁 WAF：机器请求可能弹「网站防火墙」页 → 需带 Cookie（设置里粘贴会话）或换网络。
+def _ktvc8_imgs(html: str):
+    """提取词曲网正文曲谱大图（contentpic 内优先；兜底 uploadfiles 目录大图，去重保序）。"""
+    seg = ""
+    m = re.search(r'class="contentpic"[^>]*>(.*?)</div>', html, re.S | re.I)
+    if m:
+        seg = m.group(1)
+    candidates = [seg, html]
+    out = []
+    for s in candidates:
+        urls = re.findall(
+            r'(?:src|data-src)="([^"]*?/(?:uploadfiles|uploaduserskinfiles)/[^"]+?\.(?:png|jpe?g|jpg|gif))"',
+            s, re.I)
+        for u in urls:
+            u = u.split("?")[0]
+            if u.startswith(".."):
+                u = "https://www.ktvc8.com/" + u.lstrip("./")
+            if u not in out:
+                out.append(u)
+        if out:
+            break
+    return out
+
+
+def extract_ktvc8(html: str):
+    """词曲网：提取曲谱图片 URL（含分页探测路径），按页序返回。"""
+    return _ktvc8_imgs(html)
+
+
+def ktvc8_title(html: str) -> str:
+    """从词曲网 <title> 提取干净曲名（形如「《耳朵 李荣浩 独奏版》…」→「耳朵 李荣浩 独奏版」）。"""
+    m = re.search(r'<title>([^<]+)</title>', html, re.I)
+    if not m:
+        return ""
+    t = html_mod.unescape(m.group(1)).strip()
+    # 剥书名号壳：完整的《...》→ 内部文字
+    m2 = re.search(r'《([^》]+)》', t)
+    if m2:
+        t = m2.group(1)
+    for noise in ("钢琴谱", "曲谱", "简谱", "歌谱", "独奏版", " - 词曲网", "词曲网"):
+        t = t.split(noise)[0]
+    return t.strip(" -_（）()　·,，")[:60]
+
+
+def ktvc8_page_urls(input_url: str, html: str) -> list:
+    """词曲网分页：article_XXXX_1.html 若存在 _2.._N 则返回全部页 URL，否则单页。"""
+    m = re.match(r"^(https?://[^?#]*?article_\d+)_(\d+)\.html", input_url)
+    if not m:
+        return [input_url]
+    stem, cur = m.group(1), int(m.group(2))
+    # 从页面找「共 N 页」或最大分页链接
+    maxp = cur
+    for n in re.finditer(r'article_(\d+)_(\d+)\.html', html):
+        try:
+            if int(n.group(1)) == int(re.search(r'article_(\d+)', input_url).group(1)):
+                maxp = max(maxp, int(n.group(2)))
+        except Exception:
+            pass
+    return [f"{stem}_{p}.html" for p in range(1, maxp + 1)]
 
 
 # ===================== 天天钢琴（piastudy / pianoproblem 系） =====================
@@ -517,7 +592,13 @@ def run(input_str: str, output_dir: str, theme: str = "", custom: str = ""):
     is_tan8 = "tan8.com" in input_str
     html = ""
     if input_str.lower().startswith("http"):
-        html = fetch_html(input_str)
+        ktvc8 = "ktvc8.com" in input_str.lower()
+        cookie = os.environ.get("SCORE_KTVC8_COOKIE", "")
+        html = fetch_html(input_str, cookie=cookie)
+        if ktvc8 and is_waf_page(html):
+            raise ValueError(
+                "词曲网被云锁（WAF）拦截：请在「设置」粘贴浏览器 Cookie 后重试，"
+                "或用浏览器打开该页面通过验证后再试。")
         # 虫虫钢琴：ccmz 完整曲谱（付费预览图绕过，取公开工程文件渲染）
         if "gangqinpu.com" in input_str.lower() and ".ccmz" in html:
             print("[来源] 虫虫钢琴（ccmz 完整版）")
@@ -534,6 +615,23 @@ def run(input_str: str, output_dir: str, theme: str = "", custom: str = ""):
                 return None
             if not theme and not custom:
                 custom = piastudy_title(html)  # 页面标题干净名（无自定义时）
+        elif ktvc8:
+            # 词曲网：位图谱面，支持分页收集
+            print("[来源] 词曲网（位图 · 分页）")
+            pages = ktvc8_page_urls(input_str, html)
+            images = []
+            for p_url in pages:
+                p_html = html if p_url == input_str else fetch_html(p_url, cookie=cookie)
+                if is_waf_page(p_html):
+                    break
+                imgs = _ktvc8_imgs(p_html)
+                print(f"  页 {p_url.rsplit('/', 1)[-1]}: 候选 {len(imgs)} 张")
+                images.extend(process_images(imgs, is_tan8=False))
+            if not images:
+                print("⚠ 未提取到任何曲谱图片（词曲网源），退出。")
+                return None
+            if not theme and not custom:
+                custom = ktvc8_title(html)
         else:
             urls, src = extract_urls_dispatch(input_str, html)
             print(f"[来源] {src} · 候选图片 {len(urls)} 张")
@@ -627,9 +725,12 @@ def main():
     ap.add_argument("--output-dir", default=r"G:\Lin_File\Documents\曲谱")
     ap.add_argument("--theme", default="", help="追加到文件名的额外标签（可选）")
     ap.add_argument("--name", default="", help="自定义文件名（不含扩展名）")
+    ap.add_argument("--cookie", default="", help="网站 Cookie（词曲网 ktvc8 云锁会话，可选）")
     ap.add_argument("--selftest", action="store_true", help="运行冒烟测试")
     args = ap.parse_args()
 
+    if args.cookie:
+        os.environ["SCORE_KTVC8_COOKIE"] = args.cookie
     if args.selftest:
         selftest()
         return
