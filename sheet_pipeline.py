@@ -20,7 +20,9 @@ import html as html_mod
 import io
 import os
 import re
+import subprocess
 import sys
+import tempfile
 import urllib.request
 
 # Windows 下强制 STDIO 为 UTF-8（应用内 Python 默认 GBK/cp936，会导致中文日志/文件名输出乱码或 UnicodeEncodeError）
@@ -73,6 +75,109 @@ def extract_tan8(html: str):
     """弹琴吧：提取隐藏的高清标准版曲谱 URL（*_standard/ 目录）。"""
     pat = re.compile(r'https://oss\.tan8\.com/yuepuku/\d+/\d+/\d+_\w+_standard/\d+_\w+\.ypad\.\d+\.png')
     return list(dict.fromkeys(pat.findall(html)))
+
+
+# ===================== 天天钢琴（piastudy / pianoproblem 系） =====================
+# 谱面为矢量 SVG（path/符号），且 HTML 常以 <link rel="preload" as="image"> 声明全部页。
+# 提取 sheetImg 目录下的全部页 SVG → Edge headless 高清渲染 PNG → 复用 to_pdf。
+# Edge 是 Win10+ 系统自带（WebView2/浏览器），定位不到时清晰报错。
+def _find_edge() -> str:
+    cands = [
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    ]
+    for c in cands:
+        if os.path.isfile(c):
+            return c
+    return ""
+
+
+def extract_piastudy(html: str):
+    """提取天天钢琴谱面 SVG 页码列表（sheetImg/.../{1..N}.svg），按页序返回。"""
+    urls = re.findall(r'href="(https?://[^"]*?/sheetImg/[^"]+?/(\d+)\.svg)"', html)
+    if not urls:
+        urls = re.findall(r"(https?://[^\"\\]*?/sheetImg/[^\"\\]+?/(\d+)\.svg)", html)
+    seen = {}
+    for u, num in urls:
+        u = u.replace('&quot;', '').replace('\\/', '/')
+        try:
+            seen[int(num)] = u.split('?')[0]
+        except ValueError:
+            continue
+    return [seen[k] for k in sorted(seen)]
+
+
+def piastudy_title(html: str) -> str:
+    """从页面 <title> 提取干净曲名（去掉「钢琴谱/天天钢琴/编配」噪音）。"""
+    m = re.search(r'<title>([^<]+)</title>', html, re.I)
+    if not m:
+        return ""
+    t = html_mod.unescape(m.group(1)).strip()
+    for noise in ("钢琴谱", " - 天天钢琴", "钢琴", "简谱"):
+        t = t.split(noise)[0]
+    # 书名号壳剥离：完整《...》→ 保留内部文字（李鬼文件名可读性）
+    t = re.sub(r'^《(.+?)》', r'\1', t)
+    t = re.sub(r'^《', '', t).replace('》', '')  # 残余半壳兜底
+    return t.strip(" -_（）()　·,，")[:60]
+
+
+def piastudy_svg_to_png(svg_url: str, out_png: str, edge: str) -> bool:
+    """下载 SVG → Edge headless 渲染为高清 PNG（约 600DPI，A4 竖版）。"""
+    try:
+        req = urllib.request.Request(svg_url, headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = r.read()
+    except Exception:
+        return False
+    tmp_dir = tempfile.mkdtemp(prefix="piastudy_")
+    svg_path = os.path.join(tmp_dir, "page.svg")
+    with open(svg_path, "wb") as f:
+        f.write(data)
+    try:
+        subprocess.run(
+            [edge, "--headless", "--disable-gpu",
+             f"--screenshot={out_png}", "--window-size=1680,2376",
+             "file:///" + svg_path.replace("\\", "/")],
+            timeout=60, capture_output=True,
+        )
+        return os.path.isfile(out_png) and os.path.getsize(out_png) > 20000
+    except Exception:
+        return False
+    finally:
+        try:
+            import shutil
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def process_piastudy(html: str) -> list:
+    """天天钢琴：SVG 列表 → 各页渲染 PNG → 白底 Image 列表（复用 to_pdf）。"""
+    svgs = extract_piastudy(html)
+    if not svgs:
+        return []
+    edge = _find_edge()
+    if not edge:
+        raise ValueError("天天钢琴谱面为 SVG 矢量，需系统 Microsoft Edge 渲染（Win10+ 自带）。未找到 Edge。")
+    from PIL import Image as _PILImage
+    imgs = []
+    tmpdir = tempfile.mkdtemp(prefix="piastudy_png_")
+    try:
+        for i, svg_url in enumerate(svgs):
+            png = os.path.join(tmpdir, f"p{i}.png")
+            if piastudy_svg_to_png(svg_url, png, edge):
+                img = _PILImage.open(png).convert("RGBA")
+                bg = _PILImage.new("RGB", img.size, (255, 255, 255))
+                bg.paste(img, mask=img.split()[3])
+                imgs.append(resize_standard(bg.convert("RGB")))
+                print(f"  ✓ 第{i+1}页 → {img.size[0]}×{img.size[1]}")
+    finally:
+        try:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
+    return imgs
 
 
 def extract_generic(html: str):
@@ -322,9 +427,19 @@ def run(input_str: str, output_dir: str, theme: str = "", custom: str = ""):
     html = ""
     if input_str.lower().startswith("http"):
         html = fetch_html(input_str)
-        urls, src = extract_urls_dispatch(input_str, html)
-        print(f"[来源] {src} · 候选图片 {len(urls)} 张")
-        images = process_images(urls, is_tan8=is_tan8)
+        # 天天钢琴：谱面为矢量 SVG 多页，走专用渲染（Edge headless → PNG → 白底）
+        if any(k in input_str.lower() for k in ("piastudy.com", "pianoproblem", "insstudy")):
+            print("[来源] 天天钢琴（SVG 矢量）")
+            images = process_piastudy(html)
+            if not images:
+                print("⚠ 未提取到任何曲谱图片（天天钢琴源），退出。")
+                return None
+            if not theme and not custom:
+                custom = piastudy_title(html)  # 页面标题干净名（无自定义时）
+        else:
+            urls, src = extract_urls_dispatch(input_str, html)
+            print(f"[来源] {src} · 候选图片 {len(urls)} 张")
+            images = process_images(urls, is_tan8=is_tan8)
     elif os.path.isdir(input_str):
         print("[来源] 本地图片文件夹")
         images = []
