@@ -47,6 +47,7 @@ def fetch_html(url: str, cookie: str = "") -> str:
     编码：优先 headers 里的 charset，其次 meta，最后 GBK 兜底——中文站点（词曲网）多为 GBK，
     按 UTF-8 硬解会乱码导致 WAF 误判/提取失败。"""
     headers = {"User-Agent": UA}
+    cookie = normalize_cookie(cookie)
     if cookie:
         headers["Cookie"] = cookie
     req = urllib.request.Request(url, headers=headers)
@@ -96,6 +97,19 @@ def download_bytes(url: str) -> bytes:
     req = urllib.request.Request(url, headers={"User-Agent": UA})
     with urllib.request.urlopen(req, timeout=30) as r:
         return r.read()
+
+
+def normalize_cookie(raw: str) -> str:
+    """规范化 Cookie 输入（Cookie Editor 导出容错）：
+    - 去 'Cookie:' 前缀 / 首尾空白 / 换行
+    - 去掉末尾孤立 ';' 与空段
+    返回可直接作 Cookie 头的 'k=v;k=v' 串；空输入返回 ''。"""
+    if not raw:
+        return ""
+    s = re.sub(r'(?i)^Cookie\s*:\s*', '', raw.strip())
+    s = s.replace("\r", "\n").replace("\n", " ").strip()
+    parts = [p.strip() for p in s.split(";") if p.strip()]
+    return ";".join(parts)
 
 
 def download_image(url: str):
