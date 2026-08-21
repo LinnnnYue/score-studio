@@ -251,8 +251,13 @@ def process_ccmz(input_str: str, output_dir: str) -> str:
 
 
 def _find_node() -> str:
-    """定位 Node 运行时（系统 PATH / 常见安装路径）。"""
+    """定位 Node 运行时：引擎内置 node.exe 最优先（开箱即用），再退系统 PATH / 常见安装路径。"""
     import shutil as _sh
+    eng_dir = os.path.dirname(_find_ccmz_engine())
+    if eng_dir:
+        builtin = os.path.join(eng_dir, "node.exe")
+        if os.path.isfile(builtin):
+            return builtin
     n = _sh.which("node")
     if n:
         return n
