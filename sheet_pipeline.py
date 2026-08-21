@@ -180,6 +180,92 @@ def process_piastudy(html: str) -> list:
     return imgs
 
 
+# ===================== 虫虫钢琴（gangqinpu）ccmz 完整曲谱 =====================
+# 虫虫付费谱的预览图被墙，但完整乐谱数据在公开的 ccmz 工程文件里（页面 HTML 直含 URL）。
+# ccmz = 首字节加密标记(1/2) + zip 包（内含 score.json 全曲数据）。
+# 融合 ccmz-to-midi 渲染引擎（Node + puppeteer-core + 系统 Edge）→ 直接产出完整 PDF。
+def _extract_ccmz_url(html: str) -> str:
+    """虫虫页面提取 ccmz 工程文件 URL。"""
+    m = re.search(r'(https?://[^"\' <>]+\.ccmz)', html)
+    return m.group(1).replace('&amp;', '&') if m else ""
+
+
+def _find_ccmz_engine() -> str:
+    """定位软件内 ccmz 渲染引擎（ccmz2pdf.mjs），兼容开发/安装版布局。"""
+    cands = []
+    here = os.path.dirname(os.path.abspath(__file__))
+    # 开发版
+    cands.append(os.path.join(here, "src-tauri", "resources", "ccmz-engine", "ccmz2pdf.mjs"))
+    cands.append(os.path.join(here, "ccmz-engine", "ccmz2pdf.mjs"))
+    cands.append(os.path.join(here, "resources", "ccmz-engine", "ccmz2pdf.mjs"))
+    # 安装版：exe 同级 ccmz-engine（NSIS 把引擎资源放 $INSTDIR\ccmz-engine）
+    try:
+        import sys as _s
+        exe_dir = os.path.dirname(_s.argv[0]) if _s.argv and os.path.isfile(_s.argv[0]) else here
+        cands.append(os.path.join(exe_dir, "ccmz-engine", "ccmz2pdf.mjs"))
+        if os.environ.get("SCORE_CCMZ_ENGINE"):
+            cands.insert(0, os.environ["SCORE_CCMZ_ENGINE"])
+    except Exception:
+        pass
+    return next((c for c in cands if os.path.isfile(c)), "")
+
+
+def process_ccmz(input_str: str, output_dir: str) -> str:
+    """虫虫链接 → 下载 ccmz → 调引擎 → 返回成品 PDF 路径（或抛错）。"""
+    html_text = fetch_html(input_str)
+    ccmz_url = _extract_ccmz_url(html_text)
+    if not ccmz_url:
+        raise ValueError("未在页面中找到 ccmz 工程文件（可能该曲谱无 ccmz）")
+    engine = _find_ccmz_engine()
+    if not engine:
+        raise ValueError("未找到 ccmz 渲染引擎（软件资源缺失 ccmz-engine），请更新软件")
+    # 下载 ccmz 到临时
+    tmpdir = tempfile.mkdtemp(prefix="ccmz_")
+    try:
+        ccmz_path = os.path.join(tmpdir, "score.ccmz")
+        req = urllib.request.Request(ccmz_url, headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=40) as r:
+            with open(ccmz_path, "wb") as f:
+                f.write(r.read())
+        # 干净输出名：页标题 → 去书名号壳
+        os.makedirs(output_dir, exist_ok=True)
+        title = piastudy_title(html_text) or "虫虫曲谱"
+        out = os.path.join(output_dir, title + ".pdf")
+        # 调 Node 引擎
+        node = _find_node()
+        if not node:
+            raise ValueError("未找到 Node.js 运行时（ccmz 渲染需 Node，或已内置但未检测到）")
+        cmd = [node, engine, ccmz_path, out, str(49200 + (os.getpid() % 100))]
+        proc = subprocess.run(cmd, capture_output=True, timeout=180)
+        if proc.returncode != 0 or not os.path.isfile(out):
+            err = (proc.stderr or b"").decode("utf-8", "ignore")[:400]
+            raise ValueError(f"ccmz 渲染失败: {err or '无输出'}")
+        print(f"✅ PDF 已生成：{out}（虫虫完整版）")
+        return out
+    finally:
+        try:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def _find_node() -> str:
+    """定位 Node 运行时（系统 PATH / 常见安装路径）。"""
+    import shutil as _sh
+    n = _sh.which("node")
+    if n:
+        return n
+    cands = [
+        r"C:\Program Files\nodejs\node.exe",
+        os.path.expandvars(r"%ProgramFiles%\nodejs\node.exe"),
+    ]
+    for c in cands:
+        if os.path.isfile(c):
+            return c
+    return ""
+
+
 def extract_generic(html: str):
     """通用兜底：抓取所有图片 URL，交由尺寸/体积筛选。"""
     pat = re.compile(r'src="(https?://[^"]+\.(?:png|jpe?g))"', re.I)
@@ -427,6 +513,13 @@ def run(input_str: str, output_dir: str, theme: str = "", custom: str = ""):
     html = ""
     if input_str.lower().startswith("http"):
         html = fetch_html(input_str)
+        # 虫虫钢琴：ccmz 完整曲谱（付费预览图绕过，取公开工程文件渲染）
+        if "gangqinpu.com" in input_str.lower() and ".ccmz" in html:
+            print("[来源] 虫虫钢琴（ccmz 完整版）")
+            out = process_ccmz(input_str, output_dir)
+            if out:
+                return out
+            raise ValueError("虫虫 ccmz 渲染失败")
         # 天天钢琴：谱面为矢量 SVG 多页，走专用渲染（Edge headless → PNG → 白底）
         if any(k in input_str.lower() for k in ("piastudy.com", "pianoproblem", "insstudy")):
             print("[来源] 天天钢琴（SVG 矢量）")
