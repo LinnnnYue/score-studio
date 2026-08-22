@@ -397,10 +397,13 @@ def process_ccmz(input_str: str, output_dir: str) -> str:
         if not node:
             raise ValueError("未找到 Node.js 运行时（ccmz 渲染需 Node，或已内置但未检测到）")
         cmd = [node, engine, ccmz_path, out, str(49200 + (os.getpid() % 100))]
-        proc = subprocess.run(cmd, capture_output=True, timeout=180)
+        # 显式指定 cwd=引擎目录：Node 的模块解析依赖 cwd，
+        # 安装目录含空格（如 D:\Program Files\Score Studio）时若不指定会报 lstat 'D:' 类路径解析错误
+        eng_dir = os.path.dirname(engine)
+        proc = subprocess.run(cmd, capture_output=True, timeout=180, cwd=eng_dir)
         if proc.returncode != 0 or not os.path.isfile(out):
             err = (proc.stderr or b"").decode("utf-8", "ignore")[:400]
-            raise ValueError(f"ccmz 渲染失败: {err or '无输出'}")
+            raise ValueError(f"ccmz 渲染失败: {err or '无输出'}（cmd: {' '.join(cmd)}）")
         print(f"✅ PDF 已生成：{out}（虫虫完整版）")
         return out
     finally:
