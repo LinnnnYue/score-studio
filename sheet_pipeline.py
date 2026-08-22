@@ -23,6 +23,8 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
+import urllib.error
 import urllib.request
 
 # Windows 下强制 STDIO 为 UTF-8（应用内 Python 默认 GBK/cp936，会导致中文日志/文件名输出乱码或 UnicodeEncodeError）
@@ -42,46 +44,72 @@ ILLEGAL = r'[\\/:*?"<>|]'    # Windows 非法文件名字符
 
 
 # ===================== 网络 =====================
-def fetch_html(url: str, cookie: str = "") -> str:
-    """抓取网页 HTML。cookie 传 Cookie 头（词曲网 ktvc8 云锁需带验证会话）。
-    编码：优先 headers 里的 charset，其次 meta，最后 GBK 兜底——中文站点（词曲网）多为 GBK，
-    按 UTF-8 硬解会乱码导致 WAF 误判/提取失败。"""
-    headers = {"User-Agent": UA}
-    cookie = normalize_cookie(cookie)
-    if cookie:
-        headers["Cookie"] = cookie
-    req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=30) as r:
-        data = r.read()
-        ctype = r.headers.get("Content-Type", "")
+def _decode_html(data: bytes, ctype: str = "") -> str:
+    """按 Content-Type/meta charset 声明解码，无声明或 UTF-8 有损时 GBK 兜底。"""
     raw = data.decode("utf-8", errors="ignore")
-    # Content-Type 或 <meta charset= 声明优先
     m = re.search(r"charset=([\w-]+)", ctype, re.I)
     if not m:
         m = re.search(r'<meta[^>]+charset=["\']?([\w-]+)', raw[:2000], re.I)
     enc = m.group(1).strip().lower() if m else ""
     if enc and enc not in ("utf-8", "utf8"):
         try:
-            raw = data.decode(enc, errors="ignore")
+            return data.decode(enc, errors="ignore")
         except Exception:
             pass
-    elif enc in ("utf-8", "utf8") or raw.count("\ufffd") > 20:
+    if enc in ("utf-8", "utf8") or raw.count("\ufffd") > 20:
         # UTF-8 乱码（替换符多）→ 换 GBK 兜底（常见中文站）
         try:
             gbk = data.decode("gbk", errors="ignore")
             if gbk.count("\ufffd") < raw.count("\ufffd"):
-                raw = gbk
-        except Exception:
-            pass
-    else:
-        # 无声明且 UTF-8 有损 → GBK 探测
-        try:
-            gbk = data.decode("gbk", errors="ignore")
-            if gbk.count("\ufffd") < raw.count("\ufffd"):
-                raw = gbk
+                return gbk
         except Exception:
             pass
     return raw
+
+
+def fetch_html(url: str, cookie: str = "") -> str:
+    """抓取网页 HTML。cookie 传 Cookie 头（词曲网 ktvc8 云锁需带验证会话）。
+
+    健壮性三重保障（应对代理节点不稳 / 站点 TLS 风控导致的 SSL EOF）：
+      1) 直连优先——国内站点绕开本地 Clash 等代理节点不稳的握手失败；
+      2) 系统代理降级重试（各 2 次）；
+      3) urllib 全失败后调系统 curl.exe 兜底（schannel TLS 栈更抗风控）。
+    编码：优先 headers charset → meta → GBK 兜底（中文站点多为 GBK）。"""
+    headers = {"User-Agent": UA, "Accept": "text/html,application/xhtml+xml,*/*;q=0.8"}
+    cookie = normalize_cookie(cookie)
+    if cookie:
+        headers["Cookie"] = cookie
+
+    last_err = None
+    # 1+2) 直连 → 系统代理，各重试 2 次
+    for direct in (True, False):
+        for attempt in range(2):
+            try:
+                opener = urllib.request.build_opener(
+                    urllib.request.ProxyHandler({})) if direct else urllib.request.build_opener()
+                req = urllib.request.Request(url, headers=headers)
+                with opener.open(req, timeout=30) as r:
+                    return _decode_html(r.read(), r.headers.get("Content-Type", ""))
+            except Exception as e:
+                last_err = e
+                time.sleep(1.0 * (attempt + 1))
+
+    # 3) 系统 curl.exe 兜底（schannel TLS 栈，抗站点对 python ssl 的瞬时掐断）
+    try:
+        curl = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                            "System32", "curl.exe")
+        if os.path.isfile(curl):
+            args = [curl, "-s", "-L", "--connect-timeout", "15", "-m", "45",
+                    "-A", UA, "--compressed", url]
+            if cookie:
+                args += ["-H", "Cookie: " + cookie]
+            proc = subprocess.run(args, capture_output=True, timeout=60)
+            if proc.returncode == 0 and proc.stdout:
+                return _decode_html(proc.stdout)
+    except Exception as e:
+        last_err = last_err or e
+
+    raise urllib.error.URLError(f"抓取失败（网络/SSL）：{last_err}") from last_err
 
 
 def is_waf_page(html: str) -> bool:
@@ -94,9 +122,31 @@ def is_waf_page(html: str) -> bool:
 
 
 def download_bytes(url: str) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return r.read()
+    """下载二进制内容。直连优先 + 重试 + 系统 curl.exe 兜底（应对 SSL EOF/节点不稳）。"""
+    last_err = None
+    for direct in (True, False):
+        for attempt in range(2):
+            try:
+                opener = urllib.request.build_opener(
+                    urllib.request.ProxyHandler({})) if direct else urllib.request.build_opener()
+                req = urllib.request.Request(url, headers={"User-Agent": UA})
+                with opener.open(req, timeout=30) as r:
+                    return r.read()
+            except Exception as e:
+                last_err = e
+                time.sleep(1.0 * (attempt + 1))
+    try:
+        curl = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                            "System32", "curl.exe")
+        if os.path.isfile(curl):
+            args = [curl, "-s", "-L", "--connect-timeout", "15", "-m", "60",
+                    "-A", UA, url]
+            proc = subprocess.run(args, capture_output=True, timeout=90)
+            if proc.returncode == 0 and proc.stdout:
+                return proc.stdout
+    except Exception as e:
+        last_err = last_err or e
+    raise urllib.error.URLError(f"下载失败（网络/SSL）：{last_err}") from last_err
 
 
 def normalize_cookie(raw: str) -> str:
@@ -384,10 +434,8 @@ def process_ccmz(input_str: str, output_dir: str) -> str:
     tmpdir = tempfile.mkdtemp(prefix="ccmz_")
     try:
         ccmz_path = os.path.join(tmpdir, "score.ccmz")
-        req = urllib.request.Request(ccmz_url, headers={"User-Agent": UA})
-        with urllib.request.urlopen(req, timeout=40) as r:
-            with open(ccmz_path, "wb") as f:
-                f.write(r.read())
+        with open(ccmz_path, "wb") as f:
+            f.write(download_bytes(ccmz_url))
         # 干净输出名：页标题 → 去书名号壳
         os.makedirs(output_dir, exist_ok=True)
         title = piastudy_title(html_text) or "虫虫曲谱"
