@@ -129,9 +129,17 @@ def extract_wechat(html: str):
 
 
 def extract_tan8(html: str):
-    """弹琴吧：提取隐藏的高清标准版曲谱 URL（*_standard/ 目录）。"""
-    pat = re.compile(r'https://oss\.tan8\.com/yuepuku/\d+/\d+/\d+_\w+_standard/\d+_\w+\.ypad\.\d+\.png')
-    return list(dict.fromkeys(pat.findall(html)))
+    """弹琴吧：提取隐藏的高清标准版曲谱 URL（*_standard/ 目录）。
+    页面把图片 URL 放在 JS 数组（yuepuArrXian 五线谱 / yuepuArrJian 简谱）里，
+    JSON 序列化后斜杠带 \\/ 转义（https:\\/\\/oss.tan8.com\\/...），两种形态都要匹配。"""
+    pat = re.compile(
+        r'https?:\\?/\\?/oss\.tan8\.com\\?/yuepuku\\?/\d+\\?/\d+\\?/\d+_\w+_standard\\?/\d+_\w+\.ypad\.\d+\.png')
+    urls = []
+    for u in pat.findall(html):
+        u = u.replace("\\/", "/")
+        if u not in urls:
+            urls.append(u)
+    return urls
 
 
 # ===================== 词曲网（ktvc8.com） =====================
