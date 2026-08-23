@@ -1,7 +1,7 @@
 {
   "name": "score-studio",
   "private": true,
-  "version": "0.2.4",
+  "version": "0.2.5",
   "type": "module",
   "description": "Score Studio · 曲谱工坊（巴洛克古典主题外壳 · Tauri v2 骨架）",
   "scripts": {

@@ -2,6 +2,7 @@
 // 用法: node ccmz2pdf.mjs <ccmz> [out.pdf] [port]
 import puppeteer from 'puppeteer-core';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createServer } from 'node:http';
@@ -88,11 +89,47 @@ async function main() {
   await new Promise((r) => server.listen(PORT, r));
   console.log('🚀 服务器: http://localhost:' + PORT);
 
-  const browser = await puppeteer.launch({
-    headless: 'new',
-    executablePath: EDGE,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-gpu', '--allow-file-access-from-files'],
-  });
+  // 清理可能残留的 puppeteer 临时 profile（上次崩溃留下的锁会导致下次 launch 失败）
+  try {
+    const tmp = os.tmpdir();
+    const fs2 = fs.readdirSync(tmp);
+    for (const f of fs2) {
+      if (f.startsWith('puppeteer_dev_chrome_profile')) {
+        fs.rmSync(path.join(tmp, f), { recursive: true, force: true });
+      }
+    }
+  } catch (_) {}
+
+  // 启动浏览器（失败自动重试，清残留锁后再试一次）
+  let browser = null;
+  let lastErr = null;
+  for (let attempt = 1; attempt <= 2 && !browser; attempt++) {
+    try {
+      browser = await puppeteer.launch({
+        headless: 'new',
+        executablePath: EDGE,
+        args: [
+          '--no-sandbox', '--disable-setuid-sandbox', '--disable-gpu',
+          '--disable-dev-shm-usage', '--allow-file-access-from-files',
+          '--disable-features=msEdgeSidebarV2',
+        ],
+      });
+    } catch (e) {
+      lastErr = e;
+      console.error(`⚠️ Edge 启动失败（第 ${attempt} 次）: ${e.message.slice(0, 120)}`);
+      if (attempt === 1) {
+        // 再清理一次 profile 并稍等重试（Edge 更新/崩溃后常需重启 profile）
+        try { fs.rmSync(path.join(os.tmpdir(), 'puppeteer_dev_chrome_profile'), { recursive: true, force: true }); } catch (_) {}
+        await new Promise((r) => setTimeout(r, 1200));
+      }
+    }
+  }
+  if (!browser) {
+    const edgVer = (() => { try { return fs.existsSync(EDGE) ? '存在' : '缺失'; } catch (_) { return '?'; } })();
+    console.error(`❌ Edge 浏览器无法启动（${edgVer}）。请关闭正在运行的 Edge / 杀软后重试，或重启电脑。`);
+    console.error(`   原始错误: ${lastErr ? String(lastErr).slice(0, 300) : '无'}`);
+    process.exit(2);
+  }
   const page = await browser.newPage();
 
   // 注入 blob 下载拦截
