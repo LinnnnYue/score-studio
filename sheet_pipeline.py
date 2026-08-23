@@ -18,6 +18,7 @@ Score Studio · 曲谱处理后端管道
 import argparse
 import html as html_mod
 import io
+import json
 import os
 import re
 import subprocess
@@ -113,10 +114,14 @@ def fetch_html(url: str, cookie: str = "") -> str:
 
 
 def is_waf_page(html: str) -> bool:
-    """检测是否撞上云锁/防火墙验证页（机器访问被拦的标志）。"""
+    """检测是否撞上云锁/防火墙验证页（机器访问被拦的标志）。
+    覆盖两种形态：① 大防火墙页（标题=网站防火墙）② JS 自动跳转挑战页（YunSuoAutoJump，
+    小页面 + security_verify_data 跳转，srcurl 与当前 URL 不匹配时触发）。"""
     if re.search(r"<title>\s*网站防火墙\s*</title>", html, re.I):
         return True
     if re.search(r"cloudwaf|waf\.ktvc8|验证码|滑动验证", html, re.I) and len(html) < 20000:
+        return True
+    if re.search(r"YunSuoAutoJump|security_verify_data", html) and len(html) < 5000:
         return True
     return False
 
@@ -221,6 +226,35 @@ def _ktvc8_imgs(html: str):
         if u not in out:
             out.append(u)
     return out
+
+
+def _ktvc8_fetch_js(url: str, cookie: str = "") -> tuple:
+    """词曲网云锁 JS 挑战兜底：调引擎 ktvc8_fetch.mjs（puppeteer 真实浏览器自动执行
+    YunSuoAutoJump 跳转验证 + 挖 contentpic/JS 字符串全部图，含 upload-files 新域名）。
+    返回 (imgs, title)；引擎不可用/失败返回 ([], "")。"""
+    try:
+        engine = _find_ccmz_engine()
+        node = _find_node()
+        if not engine or not node:
+            return [], ""
+        eng_dir = os.path.dirname(engine)
+        script = os.path.join(eng_dir, "ktvc8_fetch.mjs")
+        if not os.path.isfile(_clean_win_path(script)):
+            return [], ""
+        cmd = [_clean_win_path(node), _clean_win_path(script), url, cookie or ""]
+        proc = subprocess.run(cmd, capture_output=True, timeout=150, cwd=eng_dir)
+        raw = (proc.stdout or b"").decode("utf-8", "ignore")
+        if not raw:
+            raw = (proc.stderr or b"").decode("utf-8", "ignore")
+        for ln in reversed(raw.strip().splitlines()):
+            ln = ln.strip()
+            if ln.startswith("{"):
+                d = json.loads(ln)
+                imgs = [u for u in d.get("imgs", []) if u.startswith("http")]
+                return imgs, (d.get("title") or "").strip()
+    except Exception as e:
+        print(f"[warn] ktvc8 引擎兜底失败: {e}")
+    return [], ""
 
 
 def _ktvc8_probe_next(imgs: list, cookie: str = "", max_probe: int = 8) -> list:
@@ -773,10 +807,6 @@ def run(input_str: str, output_dir: str, theme: str = "", custom: str = ""):
         ktvc8 = "ktvc8.com" in input_str.lower()
         cookie = os.environ.get("SCORE_KTVC8_COOKIE", "")
         html = fetch_html(input_str, cookie=cookie)
-        if ktvc8 and is_waf_page(html):
-            raise ValueError(
-                "词曲网被云锁（WAF）拦截：请用浏览器打开页面，右键复制曲谱图片地址，"
-                "直接粘贴到本输入框重试（图片地址不受云锁限制）。")
         # 虫虫钢琴：ccmz 完整曲谱（付费预览图绕过，取公开工程文件渲染）
         if "gangqinpu.com" in input_str.lower() and ".ccmz" in html:
             print("[来源] 虫虫钢琴（ccmz 完整版）")
@@ -795,26 +825,47 @@ def run(input_str: str, output_dir: str, theme: str = "", custom: str = ""):
                 custom = piastudy_title(html)  # 页面标题干净名（无自定义时）
         elif ktvc8:
             # 词曲网：位图谱面，支持分页收集
-            print("[来源] 词曲网（位图 · 分页）")
-            pages = ktvc8_page_urls(input_str, html)
-            images = []
-            for p_url in pages:
-                p_html = html if p_url == input_str else fetch_html(p_url, cookie=cookie)
-                if is_waf_page(p_html):
-                    break
-                imgs = _ktvc8_imgs(p_html)
-                # 兜底：JS 注入型页面（剩余页图只在浏览器端生成）→ 按首图编号递增探测
-                if len(imgs) <= 1:
-                    imgs = _ktvc8_probe_next(imgs, cookie=cookie)
-                    if len(imgs) > 1:
-                        print(f"  页 {p_url.rsplit('/', 1)[-1]}: 编号探测补齐 {len(imgs)} 张")
-                print(f"  页 {p_url.rsplit('/', 1)[-1]}: 候选 {len(imgs)} 张")
-                images.extend(process_images(imgs, is_tan8=False))
-            if not images:
-                print("⚠ 未提取到任何曲谱图片（词曲网源），退出。")
-                return None
-            if not theme and not custom:
-                custom = ktvc8_title(html)
+            if is_waf_page(html):
+                # 云锁拦截（含 JS 自动跳转挑战页）→ 自动降级 puppeteer 引擎（真实浏览器执行 JS 过验证）
+                js_imgs, js_title = _ktvc8_fetch_js(input_str, cookie)
+                if not js_imgs:
+                    raise ValueError(
+                        "词曲网被云锁（WAF）拦截，且浏览器引擎兜底未取得图片："
+                        "请用浏览器打开页面，右键复制曲谱图片地址直接粘贴到本输入框重试；"
+                        "或确认软件已更新（内置浏览器引擎）。")
+                print(f"[来源] 词曲网（云锁挑战 → 浏览器引擎兜底，{len(js_imgs)} 张）")
+                images = process_images(js_imgs, is_tan8=False)
+                if not theme and not custom and js_title:
+                    custom = ktvc8_title(f"<title>{js_title}</title>")
+            else:
+                print("[来源] 词曲网（位图 · 分页）")
+                pages = ktvc8_page_urls(input_str, html)
+                images = []
+                for p_url in pages:
+                    p_html = html if p_url == input_str else fetch_html(p_url, cookie=cookie)
+                    if is_waf_page(p_html):
+                        break
+                    imgs = _ktvc8_imgs(p_html)
+                    # 兜底：JS 注入型页面（剩余页图只在浏览器端生成）→ 按首图编号递增探测
+                    if len(imgs) <= 1:
+                        imgs = _ktvc8_probe_next(imgs, cookie=cookie)
+                        if len(imgs) > 1:
+                            print(f"  页 {p_url.rsplit('/', 1)[-1]}: 编号探测补齐 {len(imgs)} 张")
+                    print(f"  页 {p_url.rsplit('/', 1)[-1]}: 候选 {len(imgs)} 张")
+                    images.extend(process_images(imgs, is_tan8=False))
+                if not images:
+                    # 常规提取 0 张 → 浏览器引擎兜底一次
+                    js_imgs, js_title = _ktvc8_fetch_js(input_str, cookie)
+                    if js_imgs:
+                        print(f"[来源] 词曲网（常规提取 0 张 → 浏览器引擎兜底，{len(js_imgs)} 张）")
+                        images = process_images(js_imgs, is_tan8=False)
+                        if not theme and not custom and js_title:
+                            custom = ktvc8_title(f"<title>{js_title}</title>")
+                if not images:
+                    print("⚠ 未提取到任何曲谱图片（词曲网源），退出。")
+                    return None
+                if not theme and not custom:
+                    custom = ktvc8_title(html)
         else:
             urls, src = extract_urls_dispatch(input_str, html)
             print(f"[来源] {src} · 候选图片 {len(urls)} 张")

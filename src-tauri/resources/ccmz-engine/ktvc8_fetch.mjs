@@ -74,20 +74,21 @@ async function run() {
       // DOM 图片
       document.querySelectorAll('.contentpic img').forEach((i) => push(i.getAttribute('src') || i.src));
       // 全局函数源码（词曲网把剩余页图写在 myFunction/show_neirong 的字符串里）
+      const UP = '(?:uploadfiles|upload-files|uploaduserskinfiles)';
       try {
         const t1 = typeof myFunction === 'function' ? myFunction.toString() : '';
-        const m1 = t1.match(/uploadfiles\/[^\s'"<>]+/g);
+        const m1 = t1.match(new RegExp(UP + '\\/[^\\s\'"<>]+', 'g'));
         if (m1) m1.forEach((u) => push(u));
       } catch (_) {}
       try {
         const t2 = typeof show_neirong === 'function' ? show_neirong.toString() : '';
-        const m2 = t2.match(/uploadfiles\/[^\s'"<>]+/g);
+        const m2 = t2.match(new RegExp(UP + '\\/[^\\s\'"<>]+', 'g'));
         if (m2) m2.forEach((u) => push(u));
       } catch (_) {}
       // 全量 script 字符串兜底
       document.querySelectorAll('script').forEach((s) => {
         const t = s.textContent || '';
-        const m = t.match(/uploadfiles\/[^\s'"<>]+/g);
+        const m = t.match(new RegExp(UP + '\\/[^\\s\'"<>]+', 'g'));
         if (m) m.forEach((u) => push(u));
       });
       return out;
