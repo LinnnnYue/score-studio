@@ -422,13 +422,18 @@ def _find_ccmz_engine() -> str:
     # 安装版：exe 同级 ccmz-engine（NSIS 把引擎资源放 $INSTDIR\ccmz-engine）
     try:
         import sys as _s
-        exe_dir = os.path.dirname(_s.argv[0]) if _s.argv and os.path.isfile(_s.argv[0]) else here
+        exe_dir = os.path.dirname(_s.argv[0]) if _s.argv and os.path.isfile(_clean_win_path(_s.argv[0])) else here
         cands.append(os.path.join(exe_dir, "ccmz-engine", "ccmz2pdf.mjs"))
         if os.environ.get("SCORE_CCMZ_ENGINE"):
             cands.insert(0, os.environ["SCORE_CCMZ_ENGINE"])
     except Exception:
         pass
-    return _clean_win_path(next((c for c in cands if os.path.isfile(c)), ""))
+    for c in cands:
+        if os.path.isfile(_clean_win_path(c)):
+            return _clean_win_path(c)
+    # 未找到：输出诊断（帮助定位残缺目录/安装异常）
+    print("[ccmz-engine 诊断] 已搜索:", " | ".join(_clean_win_path(c) for c in cands), file=sys.stderr)
+    return ""
 
 
 def process_ccmz(input_str: str, output_dir: str) -> str:
