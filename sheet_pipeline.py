@@ -401,6 +401,16 @@ def _extract_ccmz_url(html: str) -> str:
     return m.group(1).replace('&amp;', '&') if m else ""
 
 
+def _clean_win_path(p: str) -> str:
+    """剥掉 Windows 长路径前缀（Tauri 启动的 Python 会经 sys.argv[0]/__file__ 带出），
+    Node/subprocess 对带前缀的路径解析异常（lstat 'D:' 崩溃 / WinError 2）。"""
+    if not p:
+        return p
+    if p.startswith("\\\\?\\"):
+        p = p[4:]
+    return p.replace("/", "\\")
+
+
 def _find_ccmz_engine() -> str:
     """定位软件内 ccmz 渲染引擎（ccmz2pdf.mjs），兼容开发/安装版布局。"""
     cands = []
@@ -418,7 +428,7 @@ def _find_ccmz_engine() -> str:
             cands.insert(0, os.environ["SCORE_CCMZ_ENGINE"])
     except Exception:
         pass
-    return next((c for c in cands if os.path.isfile(c)), "")
+    return _clean_win_path(next((c for c in cands if os.path.isfile(c)), ""))
 
 
 def process_ccmz(input_str: str, output_dir: str) -> str:
@@ -444,6 +454,9 @@ def process_ccmz(input_str: str, output_dir: str) -> str:
         node = _find_node()
         if not node:
             raise ValueError("未找到 Node.js 运行时（ccmz 渲染需 Node，或已内置但未检测到）")
+        # 统一剥 \\?\ 前缀（Tauri 环境路径可能带长路径前缀，Node/subprocess 解析异常）
+        node, engine = _clean_win_path(node), _clean_win_path(engine)
+        ccmz_path, out = _clean_win_path(ccmz_path), _clean_win_path(out)
         cmd = [node, engine, ccmz_path, out, str(49200 + (os.getpid() % 100))]
         # 显式指定 cwd=引擎目录：Node 的模块解析依赖 cwd，
         # 安装目录含空格（如 D:\Program Files\Score Studio）时若不指定会报 lstat 'D:' 类路径解析错误
@@ -469,17 +482,17 @@ def _find_node() -> str:
     if eng_dir:
         builtin = os.path.join(eng_dir, "node.exe")
         if os.path.isfile(builtin):
-            return builtin
+            return _clean_win_path(builtin)
     n = _sh.which("node")
     if n:
-        return n
+        return _clean_win_path(n)
     cands = [
         r"C:\Program Files\nodejs\node.exe",
         os.path.expandvars(r"%ProgramFiles%\nodejs\node.exe"),
     ]
     for c in cands:
         if os.path.isfile(c):
-            return c
+            return _clean_win_path(c)
     return ""
 
 
