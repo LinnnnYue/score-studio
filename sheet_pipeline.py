@@ -738,6 +738,55 @@ def parse_title_fields(title: str):
     return title_part or "曲谱", artist_part.strip()
 
 
+# ===================== OCR 自动命名 =====================
+_OCR_ENGINE = None
+
+
+def _get_ocr_engine():
+    """惰性加载 rapidocr_onnxruntime（离线中文 OCR）。缺失/加载失败返回 None，不阻塞主流程。"""
+    global _OCR_ENGINE
+    if _OCR_ENGINE is None:
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+            _OCR_ENGINE = RapidOCR()
+        except Exception:
+            _OCR_ENGINE = False
+    return _OCR_ENGINE or None
+
+
+def ocr_first_page_title(images) -> str:
+    """对第一页曲谱图 OCR，从顶部文字行中选出标题（行高最大的首行）。
+    无 OCR 引擎 / 识别失败返回空串（不抛异常，不阻塞主流程）。"""
+    engine = _get_ocr_engine()
+    if engine is None or not images:
+        return ""
+    try:
+        import numpy as np
+        # RapidOCR 仅接受 str/ndarray/bytes/Path，直接转 ndarray（BytesIO 会抛 LoadImageError）
+        img = images[0].convert("RGB")
+        arr = np.array(img)
+        result, _ = engine(arr)
+        if not result:
+            return ""
+        # 置信度过滤（0.5 以下多为噪点）。注意 rapidocr 1.2.x 返回的置信度为字符串，须转 float
+        def _conf(r):
+            try:
+                return float(r[2])
+            except Exception:
+                return 0.0
+        lines = [r for r in result if len(r) >= 3 and _conf(r) > 0.5] or list(result)
+        if not lines:
+            return ""
+        # 取最上方 5 行中「行高最大」者——曲谱标题通常字号最大。
+        # box 为四点坐标 [[左上],[右上],[右下],[左下]]，左上 y = r[0][0][1]，行高 = 左下 y - 左上 y
+        top = sorted(lines, key=lambda r: r[0][0][1])[:5]
+        title_line = max(top, key=lambda r: r[0][3][1] - r[0][0][1])
+        t = re.sub(r"\s+", "", str(title_line[1])).strip()
+        return t or ""
+    except Exception:
+        return ""
+
+
 def derive_name(input_str: str, html_text: str = "", theme: str = "", custom: str = ""):
     """文件名：曲名[-歌手][-标签].pdf
     优先级：custom > 页面标题解析 > 本地路径 basename。
@@ -889,6 +938,16 @@ def run(input_str: str, output_dir: str, theme: str = "", custom: str = ""):
     if not images:
         print("⚠ 未提取到任何曲谱图片，退出。")
         return None
+
+    # 本地输入且未手动命名 → OCR 识别第一页标题（网页源已有 HTML 标题通道）
+    if not custom and not theme and (os.path.isdir(input_str) or os.path.isfile(input_str)):
+        _ocr = ocr_first_page_title(images)
+        if _ocr:
+            _base, _artist = parse_title_fields(_ocr)
+            custom = f"{_base}-{_artist}" if _artist else _base
+            print(f"[命名] OCR 识别第一页标题：{custom}")
+        else:
+            print("[命名] 未手动命名且 OCR 不可用（缺 rapidocr_onnxruntime 或识别失败），退回路径名；可在前端输入框补名")
 
     try:
         name = derive_name(input_str, html, theme, custom)

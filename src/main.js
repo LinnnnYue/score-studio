@@ -93,9 +93,11 @@ function addItem(t, s, src, theme, input) {
     <div class="meta">
       <div class="ttl">${t}${theme ? `<span class="tag">${theme}</span>` : ''}</div>
       <div class="src">${s} · 来源 ${src}</div>
+      <input class="q-name" maxlength="80" placeholder="命名（留空 = 自动识别第一页标题）" />
     </div>
     <div class="st">待处理</div>
-    <div class="bar"><i></i></div>`;
+    <div class="bar"><i></i></div>
+    <button class="q-del" title="移除该项">✕</button>`;
   queueEl.appendChild(el);
   statText.textContent = `队列中 ${queueEl.children.length} 项`;
   return el;
@@ -126,8 +128,15 @@ $('clearBtn').onclick = () => {
 const drop = $('drop');
 ['dragover', 'dragenter'].forEach((e) =>
   drop.addEventListener(e, (ev) => { ev.preventDefault(); drop.classList.add('hover'); }));
-['dragleave', 'drop'].forEach((e) =>
-  drop.addEventListener(e, (ev) => { ev.preventDefault(); drop.classList.remove('hover'); }));
+drop.addEventListener('dragleave', (ev) => {
+  ev.preventDefault();
+  // 只有真正离开 drop 元素本身（而非子元素）才移除高亮，避免子元素边界抖动
+  if (!drop.contains(ev.relatedTarget)) drop.classList.remove('hover');
+});
+drop.addEventListener('drop', (ev) => {
+  ev.preventDefault();
+  drop.classList.remove('hover');
+});
 // ============ 本地文件上传（本地模式无真实路径 → b64 上传到服务器临时目录） ============
 const filePicker = document.createElement('input');
 filePicker.type = 'file';
@@ -193,14 +202,121 @@ filePicker.addEventListener('change', async () => {
   }
 });
 
+function fileName(p) { return String(p).split(/[\\/]/).pop().replace(/\.[^.]+$/, ''); }
+
+function addDroppedPaths(paths) {
+  let added = 0;
+  for (const p of paths) {
+    if (!p) continue;
+    addItem(fileName(p), '本地文件 · 拖拽', '拖入', '', p);
+    added++;
+  }
+  if (added) statText.textContent = `已收入 ${added} 个本地文件`;
+  return added;
+}
+
+async function tryGetDroppedPaths(ev) {
+  const out = [];
+  // 1) 标准 FileList：仅收集带真实路径的 File（Tauri 会注入 path）
+  const files = [...ev.dataTransfer.files];
+  for (const f of files) {
+    if (f.path) out.push(f.path);
+  }
+  if (out.length) return out;
+
+  // 2) dataTransfer.items（WeChat 部分场景会走这里）
+  if (ev.dataTransfer.items && ev.dataTransfer.items.length) {
+    const items = [...ev.dataTransfer.items];
+    const strings = [];
+    for (const item of items) {
+      if (item.kind === 'file') {
+        const file = item.getAsFile();
+        if (file && file.path) out.push(file.path);
+      } else if (item.kind === 'string') {
+        strings.push(new Promise((res) => item.getAsString((s) => res(s))));
+      }
+    }
+    if (out.length) return out;
+    const resolved = (await Promise.all(strings)).filter(Boolean);
+    for (const s of resolved) {
+      const path = uriOrTextToPath(s);
+      if (path) out.push(path);
+    }
+    if (out.length) return out;
+  }
+
+  // 3) text/uri-list（file:///C:/...）
+  const uriList = ev.dataTransfer.getData('text/uri-list');
+  if (uriList) {
+    for (let line of uriList.split(/\r?\n/)) {
+      line = line.trim();
+      if (!line || line.startsWith('#')) continue;
+      const path = uriOrTextToPath(line);
+      if (path) out.push(path);
+    }
+    if (out.length) return out;
+  }
+
+  // 4) text/plain（可能是路径或 URL）
+  const plain = ev.dataTransfer.getData('text/plain');
+  if (plain) {
+    for (let line of plain.split(/\r?\n/)) {
+      line = line.trim();
+      if (!line) continue;
+      const path = uriOrTextToPath(line);
+      if (path) out.push(path);
+    }
+  }
+  return out;
+}
+
+function uriOrTextToPath(s) {
+  if (!s) return '';
+  // file:///C:/Users/... 或 file://C:/...
+  if (s.startsWith('file://')) {
+    let p = s.slice('file://'.length);
+    if (p.startsWith('/')) p = p.slice(1);
+    try { p = decodeURIComponent(p); } catch (_) {}
+    return p.replace(/\//g, '\\');
+  }
+  // 普通 URL：先尝试解码，若是本地路径则返回
+  if (/^https?:\/\//.test(s)) {
+    try {
+      const u = new URL(s);
+      if (u.protocol === 'file:' || u.pathname) {
+        const p = decodeURIComponent(u.pathname).replace(/^\//, '').replace(/\//g, '\\');
+        if (/^[A-Za-z]:\\/.test(p)) return p;
+      }
+    } catch (_) {}
+    return s;
+  }
+  // 已经是 Windows 路径
+  if (/^[A-Za-z]:[\\/]/.test(s)) return s.replace(/\//g, '\\');
+  // UNC 路径
+  if (s.startsWith('\\\\')) return s;
+  // 相对路径：若拖拽自微信临时目录，尝试当相对路径补全当前目录（少见）
+  return s;
+}
+
 drop.addEventListener('drop', async (ev) => {
   ev.preventDefault();
   drop.classList.remove('hover');
-  const files = [...ev.dataTransfer.files];
-  if (IS_TAURI) {
-    files.forEach((f) => addItem(f.name.replace(/\.[^.]+$/, ''), '本地文件', '拖入', '', f.path || f.name));
-  } else {
-    for (const f of files) {
+  const dt = ev.dataTransfer;
+  const fileObjs = [...(dt ? dt.files : [])];
+  // 优先真实路径（Tauri 注入 path / 微信 uri-list / 纯文本路径）
+  const paths = await tryGetDroppedPaths(ev);
+  if (paths.length && IS_TAURI) {
+    addDroppedPaths(paths);
+    return;
+  }
+  // 兜底：File 对象（本地服务器/浏览器模式走 b64 上传）
+  if (fileObjs.length) {
+    if (IS_TAURI) {
+      // Tauri 下 File 无 path：罕见（微信 HTML5 通道）——提示改用原生通道
+      statText.textContent = '未取得文件真实路径，请点「添加文件」选择，或将图片先保存到本地再拖入';
+      return;
+    }
+    for (const f of fileObjs) {
       try {
         statText.textContent = '上传中… ' + f.name;
         const path = await uploadOne(f);
@@ -210,9 +326,42 @@ drop.addEventListener('drop', async (ev) => {
         statText.textContent = '上传失败：' + f.name + ' · ' + e;
       }
     }
+    return;
   }
+  statText.textContent = '未识别到可处理的文件或路径；微信图片若仍失败，请先保存到桌面再拖入';
 });
 drop.addEventListener('click', pickFiles);
+const addFilesBtn = $('addFilesBtn');
+if (addFilesBtn) addFilesBtn.addEventListener('click', (ev) => { ev.stopPropagation(); pickFiles(); });
+
+// 队列项移除按钮（事件委托，一次绑定）
+queueEl.addEventListener('click', (ev) => {
+  const btn = ev.target.closest('.q-del');
+  if (!btn) return;
+  const item = btn.closest('.q');
+  if (!item) return;
+  item.remove();
+  statText.textContent = queueEl.children.length ? `队列中 ${queueEl.children.length} 项` : '队列已清空';
+});
+
+// Tauri 原生拖拽：从微信等拿不到 dataTransfer.files 的 Shell 拖拽，走官方 tauri://drag-drop 事件
+// （Tauri 会把 OS 层拖入的真实文件路径注入该事件；preventDefault 阻止其默认导航行为）
+if (IS_TAURI) {
+  import('@tauri-apps/api/event').then(({ listen }) => {
+    listen('tauri://drag-drop', (ev) => {
+      try { ev.preventDefault(); } catch (_) {}
+      const payload = ev?.payload || {};
+      const paths = Array.isArray(payload) ? payload : (payload.paths || []);
+      const real = paths.filter((p) => typeof p === 'string' && /^[A-Za-z]:[\\/]/.test(p) && !/^https?:\/\//.test(p));
+      if (real.length) addDroppedPaths(real);
+    });
+    // 拖入悬停时高亮拖拽区（OS 层事件，HTML5 dragover 不一定触发）
+    listen('tauri://drag-enter', () => drop.classList.add('hover'));
+    listen('tauri://drag-leave', () => drop.classList.remove('hover'));
+  }).catch((e) => {
+    console.error('tauri drag-drop listener failed', e);
+  });
+}
 
 // ============ 队列曲名双击编辑（无标题链接时可补名） ============
 const finishEdit = (ttl, q) => {
@@ -462,9 +611,11 @@ $('runBtn').onclick = async () => {
   for (const el of items) {
     const input = el.dataset.input || dirBox.textContent;
     const ttlEl = el.querySelector('.ttl');
-    const customName = el.dataset.edited
-      ? (ttlEl ? ttlEl.innerText.replace(/\s+/g, ' ').trim() : '')
-      : '';
+    // 命名优先级：输入框显式命名 > 双击改过的标题 > 后端自动（网页标题/OCR 首页标题）
+    const nameInput = el.querySelector('.q-name');
+    const customName = (nameInput && nameInput.value.trim())
+      ? nameInput.value.trim()
+      : (el.dataset.edited ? (ttlEl ? ttlEl.innerText.replace(/\s+/g, ' ').trim() : '') : '');
     const st = el.querySelector('.st');
     const bar = el.querySelector('.bar i');
     st.textContent = '处理中'; st.style.color = 'var(--gold-2)';

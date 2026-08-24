@@ -139,18 +139,22 @@ body.tauri .win, body.appmode .win {
 .btn-gold:hover { transform: translateY(-1px); }
 .btn-gold:active { transform: scale(0.97); }
 
-/* 拖拽区：拱形 + 五线谱纹理 */
+/* 拖拽区：拱形 + 五线谱纹理（11zon 风格：大图标 + 大标题 + 添加按钮） */
 .drop {
   border: 1.5px dashed rgba(201,169,97,0.35); border-radius: 18px 18px 14px 14px;
   background:
     repeating-linear-gradient(to bottom, transparent 0 11px, rgba(236,229,216,0.05) 11px 12px) ,
     var(--panel);
   padding: 26px; text-align: center; color: var(--muted); font-size: 12.5px;
-  margin-bottom: 18px; height: 130px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;
+  margin-bottom: 18px; height: 190px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 7px;
+  cursor: pointer;
   transition: border-color .2s ease, background .2s ease;
 }
 .drop.hover { border-color: var(--gold); background: rgba(201,169,97,0.06); }
-.drop .big { font-family: var(--serif); font-size: 15px; color: var(--ivory); }
+.drop-ic { width: 34px; height: 34px; color: var(--gold); opacity: 0.9; margin-bottom: 2px; }
+.drop .big { font-family: var(--serif); font-size: 16px; color: var(--ivory); }
+.drop .sub { font-size: 11px; line-height: 1.7; }
+.drop .drop-btn { margin-top: 7px; }
 
 .dir-row { display: flex; align-items: center; gap: 12px; margin-bottom: 24px; }
 .dir-box {
@@ -213,6 +217,21 @@ body.tauri .win, body.appmode .win {
 .q .st.err { color: #e8907f; }
 .q .bar { width: 90px; height: 4px; border-radius: 3px; background: var(--line-2); overflow: hidden; flex-shrink: 0; }
 .q .bar i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, var(--gold), var(--gold-2)); transition: width .3s ease; }
+/* 命名输入框：下单前显式命名，留空则后端自动识别第一页标题 */
+.q-name {
+  width: 100%; margin-top: 7px; height: 30px; border-radius: 8px; padding: 0 10px;
+  background: rgba(10,8,6,0.5); border: 1px solid var(--line-2); color: var(--ivory);
+  font-size: 12px; outline: none; transition: border-color .2s ease; box-sizing: border-box;
+}
+.q-name:focus { border-color: rgba(201,169,97,0.55); }
+.q-name::placeholder { color: var(--muted); opacity: .65; }
+/* 队列项移除按钮 */
+.q-del {
+  flex-shrink: 0; width: 24px; height: 24px; border-radius: 7px; cursor: pointer;
+  background: transparent; border: 1px solid transparent; color: var(--muted);
+  font-size: 12px; line-height: 1; transition: color .15s ease, border-color .15s ease, background .15s ease;
+}
+.q-del:hover { color: #e8907f; border-color: rgba(232,144,127,0.4); background: rgba(232,144,127,0.08); }
 
 /* 曲库视图 */
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 16px; }

@@ -26,7 +26,7 @@
       <div class="nav-item" data-view="library"><span class="ic">♪</span> 曲库</div>
       <div class="nav-item" data-view="inspect"><span class="ic">❖</span> 巡检</div>
       <div class="nav-item" data-view="settings"><span class="ic">⚙</span> 设置</div>
-      <div class="foot">古典 · 巴洛克<br/>主题外壳 v0.1<br/><span style="color:var(--gold)">锚点：无边框高级感</span></div>
+      <div class="foot">古典 · 巴洛克<br/>主题外壳 v0.2.7<br/><span style="color:var(--gold)">锚点：无边框高级感</span></div>
     </div>
 
     <!-- 主区 -->
@@ -54,10 +54,15 @@
           <button class="btn-gold" id="addBtn">收入队列</button>
         </div>
 
-        <div class="field-label">DROP · 拖拽或点选本地文件</div>
+        <div class="field-label">DROP · 拖入图片或 PDF</div>
         <div class="drop" id="drop">
-          <div class="big">将曲谱图片 / 文件夹拖入此处</div>
-          <div>支持 PNG · JPEG · 本地 PDF（自动重处理为统一形制）</div>
+          <svg class="drop-ic" viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M24 32V12M24 12l-7 7M24 12l7 7" />
+            <path d="M10 32v5a3 3 0 0 0 3 3h22a3 3 0 0 0 3-3v-5" opacity="0.6"/>
+          </svg>
+          <div class="big">将曲谱图片拖到此处</div>
+          <div class="sub">支持 PNG · JPEG · WEBP · BMP · PDF<br/>输出统一形制：2009px 宽 · 300 DPI · 白底</div>
+          <button class="btn-gold drop-btn" id="addFilesBtn">添加文件</button>
         </div>
 
         <div class="field-label">OUTPUT · 输出目录</div>

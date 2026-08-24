@@ -29,3 +29,7 @@ Score-Studio-Portable/
 _review/
 _selftest_in.png
 _selftest_out/
+
+# 测试产物
+_ocr_test/
+_selftest_out/
