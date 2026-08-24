@@ -85,8 +85,8 @@ if (IS_TAURI) {
 // ============== 队列（一项 = 一份 PDF，含 N 页可排序） ==============
 let qid = 0;
 
-function addItem(pages, theme, src) {
-  // pages: [{name, path}] 至少 1 项
+function addItemAsNew(pages, theme, src) {
+  // pages: [{name, path}] 至少 1 项；显式「新建一份 PDF」
   const t = pages.map((p) => p.name.replace(/\.[^.]+$/, '')).join('、');
   const el = document.createElement('div');
   el.className = 'q';
@@ -122,26 +122,38 @@ function addItem(pages, theme, src) {
   return el;
 }
 
-// 已有项追加页（拖入/选择更多文件时若用户未单独操作）
-function appendPagesToLast(paths) {
-  if (!queueEl.lastElementChild) return null;
+// 主入口：拖入/选择/链接 → 默认追加到末项（一份 PDF 多页心智）；队列空才新建
+function addPages(pages, theme, src) {
+  if (!pages || !pages.length) return null;
   const last = queueEl.lastElementChild;
-  const host = last.querySelector('[data-pages-host]');
-  const existing = (last.dataset.input || '').split('\u001e').filter(Boolean);
-  const all = [...existing, ...paths];
-  last.dataset.input = all.join('\u001e');
+  if (last && last.classList.contains('q-new-stub')) {
+    // 末项是「+ 新建曲谱」占位 → 替换为新项
+    last.remove();
+    return addItemAsNew(pages, theme, src);
+  }
+  if (last) {
+    appendPagesToEl(last, pages);
+    return last;
+  }
+  return addItemAsNew(pages, theme, src);
+}
+
+function appendPagesToEl(qEl, pages) {
+  const host = qEl.querySelector('[data-pages-host]');
+  const existing = (qEl.dataset.input || '').split('\u001e').filter(Boolean);
+  const all = [...existing, ...pages.map((p) => p.path)];
+  qEl.dataset.input = all.join('\u001e');
   for (let i = existing.length; i < all.length; i++) {
-    const p = all[i];
-    const name = p.split(/[\\/]/).pop();
+    const pp = all[i];
+    const name = pp.split(/[\\/]/).pop();
     const page = document.createElement('div');
     page.className = 'q-page';
     page.draggable = true;
-    page.dataset.path = p;
-    page.innerHTML = `<span class="q-page-num">${i + 1}</span><span class="q-page-name" title="${esc(p)}">${esc(name)}</span><button class="q-page-del" title="移除该页">✕</button>`;
+    page.dataset.path = pp;
+    page.innerHTML = `<span class="q-page-num">${i + 1}</span><span class="q-page-name" title="${esc(pp)}">${esc(name)}</span><button class="q-page-del" title="移除该页">✕</button>`;
     host.insertBefore(page, host.querySelector('.q-add-page'));
   }
-  renumberPages(last);
-  return last;
+  renumberPages(qEl);
 }
 
 function renumberPages(qEl) {
@@ -159,6 +171,16 @@ function rebuildInputFromPages(qEl) {
   qEl.dataset.input = getPages(qEl).join('\u001e');
 }
 
+// 显式「+ 新建曲谱」按钮用的占位项：标记为 stub，下一次 addPages 会替换它
+function pushNewStub() {
+  const el = document.createElement('div');
+  el.className = 'q q-new-stub';
+  el.innerHTML = `<div class="q-stub-text">新曲谱 · 拖入文件或点「+ 添加」开始</div>`;
+  queueEl.appendChild(el);
+  statText.textContent = `队列中 ${queueEl.children.length} 项`;
+  return el;
+}
+
 $('addBtn').onclick = () => {
   const raw = $('linkInput').value.trim();
   if (!raw) return;
@@ -166,18 +188,24 @@ $('addBtn').onclick = () => {
   const parts = raw.split(/[\s,，]+/).filter(Boolean);
   const imgUrls = parts.filter((p) => /^https?:\/\/\S+\.(png|jpe?g|jpg|webp)$/i.test(p));
   if (imgUrls.length > 1) {
-    addItem(imgUrls.map((u) => ({ name: u.split('/').pop(), path: u })), '', '链接');
+    addPages(imgUrls.map((u) => ({ name: u.split('/').pop(), path: u })), '', '链接');
     $('linkInput').value = '';
-    statText.textContent = `已收入 ${imgUrls.length} 条图片直链，将合并为一份 PDF`;
+    statText.textContent = `已收入 ${imgUrls.length} 条图片直链，已并入当前曲谱`;
     return;
   }
-  addItem([{ name: '来自链接的曲谱', path: parts.join(' ') }], '', '链接');
+  addPages([{ name: '来自链接的曲谱', path: parts.join(' ') }], '', '链接');
   $('linkInput').value = '';
 };
 $('clearBtn').onclick = () => {
   if (!queueEl.children.length) return;
   queueEl.innerHTML = '';
   statText.textContent = '队列已清空';
+};
+// 「+ 新建曲谱」—— 用户想分多份 PDF 时主动开新项
+const newItemBtn = $('newItemBtn');
+if (newItemBtn) newItemBtn.onclick = () => {
+  pushNewStub();
+  statText.textContent = '已新建一份曲谱占位，拖入文件即可填充';
 };
 
 // 拖拽
@@ -235,7 +263,7 @@ async function pickFiles() {
     });
     if (p) {
       const paths = Array.isArray(p) ? p : [p];
-      addItem(paths.map((pp) => ({ name: pp.split(/[\\/]/).pop(), path: pp })), '', '点选');
+      addPages(paths.map((pp) => ({ name: pp.split(/[\\/]/).pop(), path: pp })), '', '点选');
     }
     return;
   }
@@ -253,7 +281,7 @@ filePicker.addEventListener('change', async () => {
       const path = await uploadOne(f);
       pages.push({ name: f.name, path });
     }
-    addItem(pages, '', '点选/拖入');
+    addPages(pages, '', '点选/拖入');
     statText.textContent = '已收入：' + files.map((f) => f.name).join('、');
   } catch (e) {
     statText.textContent = '上传失败：' + e;
@@ -263,8 +291,8 @@ filePicker.addEventListener('change', async () => {
 function fileName(p) { return String(p).split(/[\\/]/).pop().replace(/\.[^.]+$/, ''); }
 
 function addDroppedPaths(paths) {
-  // 兼容旧调用：转给新 addItem
-  addItem(paths.map((p) => ({ name: p.split(/[\\/]/).pop(), path: p })), '', '拖入');
+  // 兼容旧调用：转给新 addPages（自动追加到末项或新建）
+  addPages(paths.map((p) => ({ name: p.split(/[\\/]/).pop(), path: p })), '', '拖入');
 }
 
 async function tryGetDroppedPaths(ev) {
@@ -358,7 +386,7 @@ drop.addEventListener('drop', async (ev) => {
   // 优先真实路径（Tauri 注入 path / 微信 uri-list / 纯文本路径）
   const paths = await tryGetDroppedPaths(ev);
   if (paths.length && IS_TAURI) {
-    addItem(paths.map((p) => ({ name: p.split(/[\\/]/).pop(), path: p })), '', '拖入');
+    addPages(paths.map((p) => ({ name: p.split(/[\\/]/).pop(), path: p })), '', '拖入');
     return;
   }
   // 兜底：File 对象（本地服务器/浏览器模式走 b64 上传）
@@ -374,7 +402,7 @@ drop.addEventListener('drop', async (ev) => {
         const path = await uploadOne(f);
         pages.push({ name: f.name, path });
       }
-      addItem(pages, '', '拖入');
+      addPages(pages, '', '拖入');
       statText.textContent = '已收入：' + fileObjs.map((f) => f.name).join('、');
     } catch (e) {
       statText.textContent = '上传失败：' + e;
@@ -410,27 +438,14 @@ queueEl.addEventListener('click', async (ev) => {
   }
   const addBtn = ev.target.closest('.q-add-page');
   if (addBtn) {
-    // 「+ 添加」→ 拉起系统文件选择，新增页追加到本项
+    // 「+ 添加」→ 拉起系统文件选择，新增页追加到本项（不追加到末项）
     if (!IS_TAURI) { statText.textContent = '本地模式请直接拖入文件到本项'; return; }
     const item = addBtn.closest('.q');
     const { open } = await import('@tauri-apps/plugin-dialog');
     const p = await open({ multiple: true, filters: [{ name: '曲谱', extensions: ['png','jpg','jpeg','pdf','webp','bmp'] }] });
     if (p) {
       const paths = Array.isArray(p) ? p : [p];
-      const host = item.querySelector('[data-pages-host]');
-      const existing = (item.dataset.input || '').split('\u001e').filter(Boolean);
-      const all = [...existing, ...paths];
-      item.dataset.input = all.join('\u001e');
-      for (let i = existing.length; i < all.length; i++) {
-        const pp = all[i];
-        const page = document.createElement('div');
-        page.className = 'q-page';
-        page.draggable = true;
-        page.dataset.path = pp;
-        page.innerHTML = `<span class="q-page-num">${i + 1}</span><span class="q-page-name" title="${esc(pp)}">${esc(pp.split(/[\\/]/).pop())}</span><button class="q-page-del" title="移除该页">✕</button>`;
-        host.insertBefore(page, host.querySelector('.q-add-page'));
-      }
-      renumberPages(item);
+      appendPagesToEl(item, paths.map((pp) => ({ name: pp.split(/[\\/]/).pop(), path: pp })));
     }
   }
 });

@@ -196,6 +196,15 @@ body.tauri .win, body.appmode .win {
 
 .sec-title { font-family: var(--serif); font-size: 16px; margin-bottom: 14px; display: flex; align-items: center; gap: 10px; }
 .sec-title .ln { flex: 1; height: 1px; background: var(--line); }
+.btn-tiny {
+  height: 24px; padding: 0 10px; border-radius: 6px; cursor: pointer;
+  background: transparent; border: 1px solid var(--line-2); color: var(--ivory);
+  font-size: 11px; line-height: 1; transition: border-color .2s ease, background .15s ease;
+}
+.btn-tiny:hover { border-color: rgba(201,169,97,0.5); background: rgba(236,229,216,0.04); }
+/* 队列「+ 新建」占位项 */
+.q.q-new-stub { padding: 16px 18px; color: var(--muted); font-size: 12px; }
+.q.q-new-stub .q-stub-text { font-style: italic; }
 
 /* 队列卡片（一项 = 一份 PDF，含 N 页可拖拽排序） */
 .queue { display: flex; flex-direction: column; gap: 10px; }
