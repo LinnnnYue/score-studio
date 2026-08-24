@@ -819,7 +819,65 @@ def derive_name(input_str: str, html_text: str = "", theme: str = "", custom: st
 
 
 # ===================== 编排 =====================
+def _run_multi(input_str: str, output_dir: str, theme: str, custom: str):
+    """多路径按序合并：队列项内多张图/多个 PDF 合并为一份 PDF。
+    input_str 用 \\u001e (ASCII RS) 分隔多个绝对路径，前端拖拽排序后用此编码传参。"""
+    paths = [p.strip() for p in input_str.split("\u001e") if p.strip()]
+    print(f"[来源] 多文件合并（{len(paths)} 项）")
+    images = []
+    for i, p in enumerate(paths):
+        try:
+            if p.lower().endswith(".pdf") and os.path.isfile(p):
+                sub = local_pdf(p)
+                images.extend(sub)
+                print(f"  [{i+1}/{len(paths)}] {os.path.basename(p)} → {len(sub)} 页")
+            elif os.path.isfile(p) and p.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp")):
+                images.append(resize_standard(_open_local(p)))
+                print(f"  [{i+1}/{len(paths)}] {os.path.basename(p)} → 1 页")
+            else:
+                print(f"  ⚠ [{i+1}/{len(paths)}] 跳过未知：{p[:80]}")
+        except Exception as e:
+            print(f"  ⚠ [{i+1}/{len(paths)}] {os.path.basename(p)} 失败：{e}")
+    if not images:
+        print("⚠ 多路径模式全部文件处理失败，退出。")
+        return None
+
+    # OCR 自动命名（与单文件一致：取第一页最上方字号最大行作标题）
+    if not custom and not theme:
+        _ocr = ocr_first_page_title(images)
+        if _ocr:
+            _base, _artist = parse_title_fields(_ocr)
+            custom = f"{_base}-{_artist}" if _artist else _base
+            print(f"[命名] OCR 识别第一页标题：{custom}")
+        else:
+            # 多文件模式兜底：取首项基名
+            custom = os.path.splitext(os.path.basename(paths[0]))[0] or "曲谱"
+            print(f"[命名] 未手动命名且 OCR 不可用，使用首项基名：{custom}")
+
+    os.makedirs(output_dir, exist_ok=True)
+    try:
+        name = derive_name(paths[0], "", theme, custom)
+    except ValueError as e:
+        print(f"⚠ {e}")
+        return None
+    out = os.path.join(output_dir, name)
+    to_pdf(images, out)
+    try:
+        from library_ops import smart_split, write_pdf_metadata
+        base = os.path.splitext(name)[0]
+        mt, ma, malb = smart_split(base)
+        if write_pdf_metadata(out, title=mt or None, artist=ma or None, album=malb or None):
+            print(f"[元数据] 已写入：曲={mt or '-'} 歌手={ma or '-'} 专辑={malb or '-'}")
+    except Exception as e:
+        print(f"[元数据] 写入跳过：{e}")
+    print(f"✅ PDF 已生成：{out}（{len(images)} 页 · {TARGET_WIDTH}px · {PDF_DPI}DPI）")
+    return out
+
+
 def run(input_str: str, output_dir: str, theme: str = "", custom: str = ""):
+    # 多路径合并模式（队列项多文件按序合一份 PDF），优先于所有其他分支
+    if "\u001e" in input_str:
+        return _run_multi(input_str, output_dir, theme, custom)
     # 编码免疫：Windows 管道默认 ANSI(GBK)，路径/曲名含 emoji 时 print 会 UnicodeEncodeError → 处理整体失败
     # 强制 stdout/stderr 为 UTF-8（StringIO 场景无 reconfigure，异常忽略即可）
     for _s in (sys.stdout, sys.stderr):

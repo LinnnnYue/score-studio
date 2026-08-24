@@ -82,25 +82,81 @@ if (IS_TAURI) {
   });
 }
 
-// ============ 队列 ============
+// ============== 队列（一项 = 一份 PDF，含 N 页可排序） ==============
 let qid = 0;
-function addItem(t, s, src, theme, input) {
+
+function addItem(pages, theme, src) {
+  // pages: [{name, path}] 至少 1 项
+  const t = pages.map((p) => p.name.replace(/\.[^.]+$/, '')).join('、');
   const el = document.createElement('div');
   el.className = 'q';
-  el.dataset.input = input || '';
+  el.draggable = true;
+  el.dataset.input = pages.map((p) => p.path).join('\u001e');
+  el.dataset.kind = 'multi';
   el.innerHTML = `
-    <div class="thumb">谱</div>
-    <div class="meta">
-      <div class="ttl">${t}${theme ? `<span class="tag">${theme}</span>` : ''}</div>
-      <div class="src">${s} · 来源 ${src}</div>
+    <div class="q-handle" title="拖动调整本项顺序">⋮⋮</div>
+    <div class="q-body">
+      <div class="q-head">
+        <div class="q-title">${esc(t) || '未命名'}</div>
+        <div class="q-meta">${pages.length} 页 · 来源 ${esc(src)}${theme ? ` · <span class="q-tag">${esc(theme)}</span>` : ''}</div>
+      </div>
+      <div class="q-pages" data-pages-host>
+        ${pages.map((p, i) => `
+          <div class="q-page" draggable="true" data-path="${esc(p.path)}">
+            <span class="q-page-num">${i + 1}</span>
+            <span class="q-page-name" title="${esc(p.path)}">${esc(p.name)}</span>
+            <button class="q-page-del" title="移除该页">✕</button>
+          </div>
+        `).join('')}
+        <button class="q-add-page" title="继续添加文件到该项">+ 添加</button>
+      </div>
       <input class="q-name" maxlength="80" placeholder="命名（留空 = 自动识别第一页标题）" />
     </div>
-    <div class="st">待处理</div>
-    <div class="bar"><i></i></div>
-    <button class="q-del" title="移除该项">✕</button>`;
+    <div class="q-side">
+      <div class="st">待处理</div>
+      <div class="bar"><i></i></div>
+      <button class="q-del" title="移除整项">✕</button>
+    </div>`;
   queueEl.appendChild(el);
   statText.textContent = `队列中 ${queueEl.children.length} 项`;
   return el;
+}
+
+// 已有项追加页（拖入/选择更多文件时若用户未单独操作）
+function appendPagesToLast(paths) {
+  if (!queueEl.lastElementChild) return null;
+  const last = queueEl.lastElementChild;
+  const host = last.querySelector('[data-pages-host]');
+  const existing = (last.dataset.input || '').split('\u001e').filter(Boolean);
+  const all = [...existing, ...paths];
+  last.dataset.input = all.join('\u001e');
+  for (let i = existing.length; i < all.length; i++) {
+    const p = all[i];
+    const name = p.split(/[\\/]/).pop();
+    const page = document.createElement('div');
+    page.className = 'q-page';
+    page.draggable = true;
+    page.dataset.path = p;
+    page.innerHTML = `<span class="q-page-num">${i + 1}</span><span class="q-page-name" title="${esc(p)}">${esc(name)}</span><button class="q-page-del" title="移除该页">✕</button>`;
+    host.insertBefore(page, host.querySelector('.q-add-page'));
+  }
+  renumberPages(last);
+  return last;
+}
+
+function renumberPages(qEl) {
+  const nums = qEl.querySelectorAll('.q-page-num');
+  nums.forEach((n, i) => { n.textContent = i + 1; });
+  const meta = qEl.querySelector('.q-meta');
+  if (meta) meta.firstChild.textContent = `${nums.length} 页 · `;
+}
+
+function getPages(qEl) {
+  return [...qEl.querySelectorAll('.q-page')].map((p) => p.dataset.path);
+}
+
+function rebuildInputFromPages(qEl) {
+  qEl.dataset.input = getPages(qEl).join('\u001e');
 }
 
 $('addBtn').onclick = () => {
@@ -110,12 +166,12 @@ $('addBtn').onclick = () => {
   const parts = raw.split(/[\s,，]+/).filter(Boolean);
   const imgUrls = parts.filter((p) => /^https?:\/\/\S+\.(png|jpe?g|jpg|webp)$/i.test(p));
   if (imgUrls.length > 1) {
-    addItem(`图片直链 ×${imgUrls.length}（合并为一份 PDF）`, '待处理', '链接', '', imgUrls.join(' '));
+    addItem(imgUrls.map((u) => ({ name: u.split('/').pop(), path: u })), '', '链接');
     $('linkInput').value = '';
     statText.textContent = `已收入 ${imgUrls.length} 条图片直链，将合并为一份 PDF`;
     return;
   }
-  addItem('来自链接的曲谱', '解析中…', '链接', '', parts.join(' '));
+  addItem([{ name: '来自链接的曲谱', path: parts.join(' ') }], '', '链接');
   $('linkInput').value = '';
 };
 $('clearBtn').onclick = () => {
@@ -179,8 +235,7 @@ async function pickFiles() {
     });
     if (p) {
       const paths = Array.isArray(p) ? p : [p];
-      paths.forEach((f) =>
-        addItem(f.split(/[\\/]/).pop().replace(/\.[^.]+$/, ''), '本地文件 · 真实路径', '点选', '', f));
+      addItem(paths.map((pp) => ({ name: pp.split(/[\\/]/).pop(), path: pp })), '', '点选');
     }
     return;
   }
@@ -190,29 +245,26 @@ async function pickFiles() {
 filePicker.addEventListener('change', async () => {
   const files = [...filePicker.files];
   filePicker.value = '';
-  for (const f of files) {
-    try {
-      statText.textContent = '上传中… ' + f.name;
+  if (!files.length) return;
+  try {
+    statText.textContent = '上传中… ' + files.map((f) => f.name).join('、');
+    const pages = [];
+    for (const f of files) {
       const path = await uploadOne(f);
-      addItem(f.name.replace(/\.[^.]+$/, ''), '本地文件 · 已上传', '点选/拖入', '', path);
-      statText.textContent = '已收入：' + f.name;
-    } catch (e) {
-      statText.textContent = '上传失败：' + f.name + ' · ' + e;
+      pages.push({ name: f.name, path });
     }
+    addItem(pages, '', '点选/拖入');
+    statText.textContent = '已收入：' + files.map((f) => f.name).join('、');
+  } catch (e) {
+    statText.textContent = '上传失败：' + e;
   }
 });
 
 function fileName(p) { return String(p).split(/[\\/]/).pop().replace(/\.[^.]+$/, ''); }
 
 function addDroppedPaths(paths) {
-  let added = 0;
-  for (const p of paths) {
-    if (!p) continue;
-    addItem(fileName(p), '本地文件 · 拖拽', '拖入', '', p);
-    added++;
-  }
-  if (added) statText.textContent = `已收入 ${added} 个本地文件`;
-  return added;
+  // 兼容旧调用：转给新 addItem
+  addItem(paths.map((p) => ({ name: p.split(/[\\/]/).pop(), path: p })), '', '拖入');
 }
 
 async function tryGetDroppedPaths(ev) {
@@ -306,25 +358,26 @@ drop.addEventListener('drop', async (ev) => {
   // 优先真实路径（Tauri 注入 path / 微信 uri-list / 纯文本路径）
   const paths = await tryGetDroppedPaths(ev);
   if (paths.length && IS_TAURI) {
-    addDroppedPaths(paths);
+    addItem(paths.map((p) => ({ name: p.split(/[\\/]/).pop(), path: p })), '', '拖入');
     return;
   }
   // 兜底：File 对象（本地服务器/浏览器模式走 b64 上传）
   if (fileObjs.length) {
     if (IS_TAURI) {
-      // Tauri 下 File 无 path：罕见（微信 HTML5 通道）——提示改用原生通道
       statText.textContent = '未取得文件真实路径，请点「添加文件」选择，或将图片先保存到本地再拖入';
       return;
     }
-    for (const f of fileObjs) {
-      try {
-        statText.textContent = '上传中… ' + f.name;
+    try {
+      statText.textContent = '上传中… ' + fileObjs.map((f) => f.name).join('、');
+      const pages = [];
+      for (const f of fileObjs) {
         const path = await uploadOne(f);
-        addItem(f.name.replace(/\.[^.]+$/, ''), '本地文件 · 已上传', '拖入', '', path);
-        statText.textContent = '已收入：' + f.name;
-      } catch (e) {
-        statText.textContent = '上传失败：' + f.name + ' · ' + e;
+        pages.push({ name: f.name, path });
       }
+      addItem(pages, '', '拖入');
+      statText.textContent = '已收入：' + fileObjs.map((f) => f.name).join('、');
+    } catch (e) {
+      statText.textContent = '上传失败：' + e;
     }
     return;
   }
@@ -334,14 +387,156 @@ drop.addEventListener('click', pickFiles);
 const addFilesBtn = $('addFilesBtn');
 if (addFilesBtn) addFilesBtn.addEventListener('click', (ev) => { ev.stopPropagation(); pickFiles(); });
 
-// 队列项移除按钮（事件委托，一次绑定）
-queueEl.addEventListener('click', (ev) => {
+// ============== 队列事件委托（删除/添加页） ==============
+queueEl.addEventListener('click', async (ev) => {
   const btn = ev.target.closest('.q-del');
-  if (!btn) return;
-  const item = btn.closest('.q');
-  if (!item) return;
-  item.remove();
-  statText.textContent = queueEl.children.length ? `队列中 ${queueEl.children.length} 项` : '队列已清空';
+  if (btn) {
+    const item = btn.closest('.q');
+    if (item) { item.remove(); statText.textContent = queueEl.children.length ? `队列中 ${queueEl.children.length} 项` : '队列已清空'; }
+    return;
+  }
+  const pageDel = ev.target.closest('.q-page-del');
+  if (pageDel) {
+    const page = pageDel.closest('.q-page');
+    const item = pageDel.closest('.q');
+    if (item && page) {
+      page.remove();
+      rebuildInputFromPages(item);
+      renumberPages(item);
+      if (!item.querySelectorAll('.q-page').length) item.remove();
+      statText.textContent = queueEl.children.length ? `队列中 ${queueEl.children.length} 项` : '队列已清空';
+    }
+    return;
+  }
+  const addBtn = ev.target.closest('.q-add-page');
+  if (addBtn) {
+    // 「+ 添加」→ 拉起系统文件选择，新增页追加到本项
+    if (!IS_TAURI) { statText.textContent = '本地模式请直接拖入文件到本项'; return; }
+    const item = addBtn.closest('.q');
+    const { open } = await import('@tauri-apps/plugin-dialog');
+    const p = await open({ multiple: true, filters: [{ name: '曲谱', extensions: ['png','jpg','jpeg','pdf','webp','bmp'] }] });
+    if (p) {
+      const paths = Array.isArray(p) ? p : [p];
+      const host = item.querySelector('[data-pages-host]');
+      const existing = (item.dataset.input || '').split('\u001e').filter(Boolean);
+      const all = [...existing, ...paths];
+      item.dataset.input = all.join('\u001e');
+      for (let i = existing.length; i < all.length; i++) {
+        const pp = all[i];
+        const page = document.createElement('div');
+        page.className = 'q-page';
+        page.draggable = true;
+        page.dataset.path = pp;
+        page.innerHTML = `<span class="q-page-num">${i + 1}</span><span class="q-page-name" title="${esc(pp)}">${esc(pp.split(/[\\/]/).pop())}</span><button class="q-page-del" title="移除该页">✕</button>`;
+        host.insertBefore(page, host.querySelector('.q-add-page'));
+      }
+      renumberPages(item);
+    }
+  }
+});
+
+// ============== 拖拽排序（队列项 + 子页） ==============
+// 队列项整体 draggable，dataTransfer.type='item'；子页 draggable，type='page'
+queueEl.addEventListener('dragstart', (ev) => {
+  const item = ev.target.closest('.q');
+  const page = ev.target.closest('.q-page');
+  if (page && item && item.contains(page)) {
+    ev.dataTransfer.setData('text/plain', 'page');
+    ev.dataTransfer.effectAllowed = 'move';
+    page.classList.add('dragging');
+    ev.dataTransfer.setData('text/page-idx', [...item.querySelectorAll('.q-page')].indexOf(page).toString());
+    ev.dataTransfer.setData('text/parent', [...queueEl.children].indexOf(item).toString());
+  } else if (item) {
+    ev.dataTransfer.setData('text/plain', 'item');
+    ev.dataTransfer.effectAllowed = 'move';
+    item.classList.add('dragging');
+  }
+});
+queueEl.addEventListener('dragend', (ev) => {
+  const el = ev.target.closest('.dragging');
+  if (el) el.classList.remove('dragging');
+  queueEl.querySelectorAll('.drop-before, .drop-after').forEach((n) => n.classList.remove('drop-before', 'drop-after'));
+});
+
+function getDragInsertPoint(ev, container, childSelector) {
+  // 返回 {node, before: bool} —— 鼠标上方 1/3 放前面，下方 2/3 放后面
+  const children = [...container.querySelectorAll(childSelector)];
+  for (const c of children) {
+    if (c.classList.contains('dragging')) continue;
+    const r = c.getBoundingClientRect();
+    const mid = r.top + r.height / 2;
+    if (ev.clientY < mid) return { node: c, before: true };
+  }
+  return { node: null, before: false };
+}
+
+queueEl.addEventListener('dragover', (ev) => {
+  const type = ev.dataTransfer.types.includes('text/plain') ? 'text/plain' : null;
+  if (!type) return;
+  ev.preventDefault();
+  ev.dataTransfer.dropEffect = 'move';
+  const pageOver = ev.target.closest('.q-page');
+  const itemOver = ev.target.closest('.q');
+  queueEl.querySelectorAll('.drop-before, .drop-after').forEach((n) => n.classList.remove('drop-before', 'drop-after'));
+  if (pageOver) {
+    const r = pageOver.getBoundingClientRect();
+    const before = ev.clientY < r.top + r.height / 2;
+    pageOver.classList.add(before ? 'drop-before' : 'drop-after');
+  } else if (itemOver) {
+    const r = itemOver.getBoundingClientRect();
+    const before = ev.clientY < r.top + r.height / 2;
+    itemOver.classList.add(before ? 'drop-before' : 'drop-after');
+  }
+});
+
+queueEl.addEventListener('drop', (ev) => {
+  ev.preventDefault();
+  ev.stopPropagation();
+  const kind = ev.dataTransfer.getData('text/plain');
+  queueEl.querySelectorAll('.drop-before, .drop-after').forEach((n) => n.classList.remove('drop-before', 'drop-after'));
+
+  if (kind === 'item') {
+    const dragging = queueEl.querySelector('.q.dragging');
+    if (!dragging) return;
+    // 决定插入位置：找最近的 .q（非自身）
+    const target = ev.target.closest('.q');
+    if (!target || target === dragging) {
+      // 放到队尾
+      queueEl.appendChild(dragging);
+      return;
+    }
+    const r = target.getBoundingClientRect();
+    const before = ev.clientY < r.top + r.height / 2;
+    queueEl.insertBefore(dragging, before ? target : target.nextSibling);
+  } else if (kind === 'page') {
+    const parentIdx = Number(ev.dataTransfer.getData('text/parent'));
+    const pageIdx = Number(ev.dataTransfer.getData('text/page-idx'));
+    const fromItem = queueEl.children[parentIdx];
+    if (!fromItem) return;
+    const fromPage = fromItem.querySelectorAll('.q-page')[pageIdx];
+    if (!fromPage) return;
+    // 目标：鼠标下的 .q-page 或 .q（落到其项的末尾）
+    const pageTarget = ev.target.closest('.q-page');
+    const itemTarget = ev.target.closest('.q');
+    if (pageTarget && pageTarget !== fromPage) {
+      const r = pageTarget.getBoundingClientRect();
+      const before = ev.clientY < r.top + r.height / 2;
+      pageTarget.parentNode.insertBefore(fromPage, before ? pageTarget : pageTarget.nextSibling);
+    } else if (itemTarget && itemTarget !== fromItem) {
+      const host = itemTarget.querySelector('[data-pages-host]');
+      const addBtn = host.querySelector('.q-add-page');
+      host.insertBefore(fromPage, addBtn);
+    } else if (itemTarget === fromItem) {
+      // 自身内排序：放到末尾
+      const host = fromItem.querySelector('[data-pages-host]');
+      const addBtn = host.querySelector('.q-add-page');
+      host.insertBefore(fromPage, addBtn);
+    }
+    // 同步：原项若空了要移除；新项 input 重算
+    if (!fromItem.querySelectorAll('.q-page').length) fromItem.remove();
+    const newParent = fromPage.closest('.q');
+    if (newParent) { rebuildInputFromPages(newParent); renumberPages(newParent); }
+  }
 });
 
 // Tauri 原生拖拽：从微信等拿不到 dataTransfer.files 的 Shell 拖拽，走官方 tauri://drag-drop 事件
@@ -363,32 +558,8 @@ if (IS_TAURI) {
   });
 }
 
-// ============ 队列曲名双击编辑（无标题链接时可补名） ============
-const finishEdit = (ttl, q) => {
-  ttl.contentEditable = 'false';
-  ttl.innerText = ttl.innerText.replace(/\s+/g, ' ').trim() || '未命名';
-  q.dataset.edited = '1';
-  statText.textContent = '曲名已改：' + ttl.innerText;
-};
-queueEl.addEventListener('dblclick', (ev) => {
-  const ttl = ev.target.closest('.ttl');
-  if (!ttl) return;
-  ttl.querySelectorAll('.tag').forEach((t) => t.remove());
-  ttl.contentEditable = 'true';
-  ttl.focus();
-  const sel = window.getSelection();
-  sel.selectAllChildren(ttl);
-});
-queueEl.addEventListener('keydown', (ev) => {
-  if (ev.key === 'Enter' || ev.key === 'Escape') {
-    const ttl = ev.target.closest('.ttl');
-    if (ttl && ttl.isContentEditable) { ev.preventDefault(); finishEdit(ttl, ttl.closest('.q')); ttl.blur(); }
-  }
-});
-queueEl.addEventListener('focusout', (ev) => {
-  const ttl = ev.target.closest('.ttl');
-  if (ttl && ttl.isContentEditable) finishEdit(ttl, ttl.closest('.q'));
-});
+// 队列命名（每项 .q-name 输入框）— runBtn 直接读取 .q-name.value
+// 旧的 ttl 双击编辑已弃用（结构改为多页子项后不再需要）
 
 // ============ 目录选择 ============
 const DIR_PICKS = ['G:\\Lin_File\\Documents\\曲谱', 'G:\\Lin_File\\Documents\\曲谱\\归档_已发送给老公', 'D:\\Music\\小提琴谱', 'G:\\Lin_File\\Documents\\曲谱\\归档'];
@@ -604,18 +775,14 @@ $('openOutBtn').onclick = openOutputDir;
 // ============ 开始处理 ============
 $('runBtn').onclick = async () => {
   const items = [...queueEl.children];
-  if (!items.length) { statText.textContent = '队列为空，请先收入链接'; return; }
+  if (!items.length) { statText.textContent = '队列为空，请先收入链接或文件'; return; }
   logBox.classList.remove('hidden');
   logBox.textContent = '';
   let done = 0;
   for (const el of items) {
     const input = el.dataset.input || dirBox.textContent;
-    const ttlEl = el.querySelector('.ttl');
-    // 命名优先级：输入框显式命名 > 双击改过的标题 > 后端自动（网页标题/OCR 首页标题）
     const nameInput = el.querySelector('.q-name');
-    const customName = (nameInput && nameInput.value.trim())
-      ? nameInput.value.trim()
-      : (el.dataset.edited ? (ttlEl ? ttlEl.innerText.replace(/\s+/g, ' ').trim() : '') : '');
+    const customName = nameInput ? nameInput.value.trim() : '';
     const st = el.querySelector('.st');
     const bar = el.querySelector('.bar i');
     st.textContent = '处理中'; st.style.color = 'var(--gold-2)';
@@ -623,7 +790,7 @@ $('runBtn').onclick = async () => {
       const res = await callProcess({
         input,
         outputDir: dirBox.textContent,
-        theme: themeOn ? (el.querySelector('.tag') ? el.querySelector('.tag').textContent : '') : '',
+        theme: '',
         name: customName,
         cookie: cookieInput ? cookieInput.value.trim() : '',
       });
@@ -633,13 +800,12 @@ $('runBtn').onclick = async () => {
         logBox.textContent += `✓ ${res.path}\n${res.log || ''}\n`;
       } else {
         st.textContent = '失败'; st.classList.add('err'); st.classList.remove('done');
-        // 真实原因优先：stderr（error）→ stdout 里的失败提示（log）→ 兜底「未知错误」
         const errMsg = (res && res.error && res.error.trim())
           ? res.error.trim()
           : ((res && res.log && res.log.trim()) ? res.log.trim() : '未知错误（无后端诊断）');
         logBox.textContent += `✗ ${errMsg}\n`;
         if (res && res.error && res.error.includes('无法自动命名')) {
-          statText.textContent = '页面无标题，请双击该曲目名称补名后重试';
+          statText.textContent = '页面无标题，请在该项命名输入框补名后重试';
         }
       }
     } catch (e) {
