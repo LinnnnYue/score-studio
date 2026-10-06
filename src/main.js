@@ -181,6 +181,18 @@ function pushNewStub() {
   return el;
 }
 
+// 整段分享文本 → 链接列表。手机 App 的「分享」会带上中文前缀与尾随符号，
+// 中文/全角标点一律不纳入链接（后端 extract_url 同规则）。
+const URL_IN_TEXT = /https?:\/\/[^\s\u4e00-\u9fff\u3000-\u303f\uff01-\uff5e<>"'）】》]+/g;
+
+// 从分享文本里给队列项取个可读名：取链接前那段中文，剥掉「分享曲谱」壳与歌手，留曲名
+function shareLabel(raw, url) {
+  const head = raw.slice(0, raw.indexOf(url)).trim().replace(/[，,。;；、\s]+$/, '');
+  if (!head) return '来自链接的曲谱';
+  const tail = head.split(/[·•]/).pop().trim();   // 「分享曲谱-萧敬腾、HOYO-MiX·天生鬼才」→ 天生鬼才
+  return (tail || head).replace(/^分享(曲谱|乐谱|链接)?[-—–\s]*/, '').slice(0, 40) || '来自链接的曲谱';
+}
+
 $('addBtn').onclick = () => {
   const raw = $('linkInput').value.trim();
   if (!raw) return;
@@ -191,6 +203,17 @@ $('addBtn').onclick = () => {
     addPages(imgUrls.map((u) => ({ name: u.split('/').pop(), path: u })), '', '链接');
     $('linkInput').value = '';
     statText.textContent = `已收入 ${imgUrls.length} 条图片直链，已并入当前曲谱`;
+    return;
+  }
+  // 整段分享文本（如「分享曲谱-萧敬腾、HOYO-MiX·天生鬼才 https://h5.kugou.com/...」）→ 自动只取链接
+  const links = (raw.match(URL_IN_TEXT) || []).map((u) => u.replace(/[.,;]+$/, ''));
+  if (links.length) {
+    const multi = links.length > 1;
+    addPages([{ name: shareLabel(raw, links[0]), path: links.join(' ') }], '', '链接');
+    $('linkInput').value = '';
+    statText.textContent = multi
+      ? `已识别 ${links.length} 条链接，已并入当前曲谱`
+      : `已识别链接，已并入当前曲谱：${shareLabel(raw, links[0])}`;
     return;
   }
   addPages([{ name: '来自链接的曲谱', path: parts.join(' ') }], '', '链接');
@@ -639,6 +662,131 @@ function safeParse(s) {
   return JSON.parse(t);
 }
 
+// 词曲网云锁验证码弹窗 A（两阶段重跑版）：返回 Promise<答案|null>
+//   用于非 @ask 环境：自动失败抛 KTVC8_CAPTCHA=<path> → 本弹窗 → 用户输入 → 携答案重跑。
+function showCaptchaDialogAsk(capPath) {
+  const overlay = document.getElementById('captchaOverlay');
+  const img = document.getElementById('captchaImg');
+  const input = document.getElementById('captchaInput');
+  if (!overlay || !img) return null;
+  const rawUrl = capPath.replace(/\\/g, '/');
+  if (IS_TAURI) {
+    import('@tauri-apps/api/core').then(async ({ invoke }) => {
+      try {
+        const uri = await invoke('read_captcha_image', { path: capPath });
+        img.src = (typeof uri === 'string' && uri.startsWith('data:')) ? uri : rawUrl;
+      } catch (_) { img.src = rawUrl; }
+    }).catch(() => { img.src = rawUrl; });
+  } else {
+    img.src = rawUrl;
+  }
+  input.value = '';
+  overlay.classList.remove('hidden');
+  setTimeout(() => input.focus(), 50);
+  return new Promise((resolve) => {
+    const done = (val) => {
+      overlay.classList.add('hidden');
+      const c = document.getElementById('captchaConfirm');
+      const x = document.getElementById('captchaCancel');
+      if (c) c.onclick = null;
+      if (x) x.onclick = null;
+      input.onkeydown = null;
+      resolve(val);
+    };
+    document.getElementById('captchaConfirm').onclick = () => {
+      const v = input.value.trim();
+      if (!v) { input.focus(); return; }
+      done(v);
+    };
+    document.getElementById('captchaCancel').onclick = () => done(null);
+    input.onkeydown = (e) => {
+      if (e.key === 'Enter') { const v = input.value.trim(); if (v) done(v); }
+    };
+  });
+}
+
+// 词曲网云锁验证码弹窗 B（同会话 @ask 模式）：
+//   Python 挂起等答案文件 → 打印 __KTVC8_CAPTCHA_SHOW__ 标记 → Tauri emit 'ktvc8-captcha'
+//   → 本弹窗显示验证码图 → 用户输入 → 写答案文件 → Python 同会话提交 → 子进程结束。
+let captchaOverlay = null;
+let captchaImg = null;
+let captchaInput = null;
+let captchaHidden = false;
+
+async function writeCaptchaAnswer(val) {
+  try {
+    const { invoke } = await import('@tauri-apps/api/core');
+    // 答案文件路径由 Rust 侧统一计算（系统 TEMP/score_ktvc8_answer.txt），
+    // 与 Python tempfile.gettempdir() 对齐——前端只传答案文本，避免路径不一致。
+    return !!(await invoke('write_text_file', { text: val || '' }));
+  } catch (_) { return false; }
+}
+
+function showCaptchaDialog(capPath) {
+  if (!captchaOverlay) {
+    captchaOverlay = document.getElementById('captchaOverlay');
+    captchaImg = document.getElementById('captchaImg');
+    captchaInput = document.getElementById('captchaInput');
+  }
+  if (!captchaOverlay || !captchaImg) return;
+  captchaHidden = false;
+  const hintEl = document.getElementById('captchaHint');
+  if (hintEl) hintEl.textContent = '';
+  // Tauri：后端读图转 base64；浏览器直接 file 路径
+  const rawUrl = capPath.replace(/\\/g, '/');
+  if (IS_TAURI) {
+    import('@tauri-apps/api/core').then(async ({ invoke }) => {
+      try {
+        const uri = await invoke('read_captcha_image', { path: capPath });
+        captchaImg.src = (typeof uri === 'string' && uri.startsWith('data:')) ? uri : rawUrl;
+      } catch (_) { captchaImg.src = rawUrl; }
+    }).catch(() => { captchaImg.src = rawUrl; });
+  } else {
+    captchaImg.src = rawUrl;
+  }
+  captchaImg.onclick = () => { window.open(captchaImg.src, '_blank'); };
+  captchaInput.value = '';
+  captchaOverlay.classList.remove('hidden');
+  setTimeout(() => captchaInput.focus(), 50);
+
+  // 绑定确认/取消/回车 → 写答案文件（await 成功才关窗；失败提示并保留弹窗重试）
+  const submitAnswer = async (val) => {
+    if (!val) { captchaInput.focus(); return; }
+    const ok = await writeCaptchaAnswer(val);
+    if (ok) {
+      captchaOverlay.classList.add('hidden');
+      captchaHidden = true;
+    } else {
+      captchaInput.value = '';
+      captchaOverlay.classList.remove('hidden');
+      const hint = document.getElementById('captchaHint');
+      if (hint) hint.textContent = '✗ 答案写入失败，请重试';
+    }
+  };
+  document.getElementById('captchaConfirm').onclick = () => {
+    submitAnswer(captchaInput.value.trim());
+  };
+  document.getElementById('captchaCancel').onclick = () => {
+    writeCaptchaAnswer('__CANCEL__');
+    captchaOverlay.classList.add('hidden');
+    captchaHidden = true;
+  };
+  captchaInput.onkeydown = (e) => {
+    if (e.key === 'Enter') submitAnswer(captchaInput.value.trim());
+  };
+}
+
+// 监听后端验证码事件（同会话 @ask 模式）
+if (IS_TAURI) {
+  import('@tauri-apps/api/event').then(({ listen }) => {
+    listen('ktvc8-captcha', (ev) => {
+      const path = (ev && ev.payload) || '';
+      if (!path || captchaHidden) return;
+      showCaptchaDialog(path);
+    }).catch(() => {});
+  }).catch(() => {});
+}
+
 async function callProcess(payload) {
   if (IS_TAURI) {
     const { invoke } = await import('@tauri-apps/api/core');
@@ -802,25 +950,63 @@ $('runBtn').onclick = async () => {
     const bar = el.querySelector('.bar i');
     st.textContent = '处理中'; st.style.color = 'var(--gold-2)';
     try {
-      const res = await callProcess({
+      let res = await callProcess({
         input,
         outputDir: dirBox.textContent,
         theme: '',
         name: customName,
         cookie: cookieInput ? cookieInput.value.trim() : '',
+        captcha: '',
       });
       if (res && res.ok) {
         st.textContent = '已完成'; st.classList.add('done'); st.classList.remove('err');
         bar.style.width = '100%';
         logBox.textContent += `✓ ${res.path}\n${res.log || ''}\n`;
       } else {
-        st.textContent = '失败'; st.classList.add('err'); st.classList.remove('done');
-        const errMsg = (res && res.error && res.error.trim())
-          ? res.error.trim()
-          : ((res && res.log && res.log.trim()) ? res.log.trim() : '未知错误（无后端诊断）');
-        logBox.textContent += `✗ ${errMsg}\n`;
-        if (res && res.error && res.error.includes('无法自动命名')) {
-          statText.textContent = '页面无标题，请在该项命名输入框补名后重试';
+        // 词曲网验证码两阶段兜底（仅非 @ask 环境）：
+        //   弹窗 → 用户输入 → 携答案重跑（最多 3 次）
+        const errText = ((res && res.error) || (res && res.log) || '').trim();
+        const capMatch = errText.match(/KTVC8_CAPTCHA=([^\s\n]+)/);
+        if (capMatch) {
+          let answered = false;
+          for (let i = 0; i < 3; i++) {
+            const ans = await showCaptchaDialogAsk(capMatch[1]);
+            if (!ans) break; // 用户放弃
+            logBox.textContent += `⏳ 验证码已输入，重新提交…\n`;
+            await yieldToUI();
+            res = await callProcess({
+              input,
+              outputDir: dirBox.textContent,
+              theme: '',
+              name: customName,
+              cookie: cookieInput ? cookieInput.value.trim() : '',
+              captcha: ans,
+            });
+            if (res && res.ok) {
+              st.textContent = '已完成'; st.classList.add('done'); st.classList.remove('err');
+              bar.style.width = '100%';
+              logBox.textContent += `✓ ${res.path}\n${res.log || ''}\n`;
+              answered = true;
+              break;
+            }
+            const e2 = ((res && res.error) || (res && res.log) || '').trim();
+            const m2 = e2.match(/KTVC8_CAPTCHA=([^\s\n]+)/);
+            if (m2) continue; // 验证码输入错误，换新图重弹
+            logBox.textContent += `✗ ${e2}\n`;
+            answered = true;
+            break;
+          }
+          if (!answered) {
+            st.textContent = '失败'; st.classList.add('err'); st.classList.remove('done');
+            logBox.textContent += `✗ ${errText}\n`;
+          }
+        } else {
+          st.textContent = '失败'; st.classList.add('err'); st.classList.remove('done');
+          const errMsg = errText || '未知错误（无后端诊断）';
+          logBox.textContent += `✗ ${errMsg}\n`;
+          if (res && res.error && res.error.includes('无法自动命名')) {
+            statText.textContent = '页面无标题，请在该项命名输入框补名后重试';
+          }
         }
       }
     } catch (e) {

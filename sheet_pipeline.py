@@ -16,6 +16,8 @@ Score Studio · 曲谱处理后端管道
 """
 
 import argparse
+import base64 as _b64
+import gzip as _gz
 import html as html_mod
 import io
 import json
@@ -27,6 +29,14 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from xml.sax.saxutils import escape
+
+# 嵌入式 Python（python313._pth）里 "." 指向解释器目录而非脚本目录，
+# 导致同级的 library_ops.py（元数据写入）永远 import 不到。
+# 显式把脚本所在目录加入 sys.path[0]，保证安装版/便携版都能 import 到同级模块。
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
 
 # Windows 下强制 STDIO 为 UTF-8（应用内 Python 默认 GBK/cp936，会导致中文日志/文件名输出乱码或 UnicodeEncodeError）
 for _s in (sys.stdin, sys.stdout, sys.stderr):
@@ -42,6 +52,20 @@ PDF_QUALITY = 95            # 质量参照（PDF 为无损封装，等效此级�
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36")
 ILLEGAL = r'[\\/:*?"<>|]'    # Windows 非法文件名字符
+
+# 从整段分享文本里抽链接：手机 App 的「分享」会带上中文前缀与后缀，
+# 形如「分享曲谱-萧敬腾、HOYO-MiX·天生鬼才 https://h5.kugou.com/... 」。
+# 中文与全角标点一律视为 URL 的终止符。
+_URL_IN_TEXT = re.compile(
+    r'https?://[^\s\u4e00-\u9fff\u3000-\u303f\uff01-\uff5e<>"\'）】》]+')
+
+
+def extract_url(text: str) -> str:
+    """整段文本 → 第一个 http(s) 链接。无链接时原样返回（兼容本地路径与纯链接）。"""
+    if not text:
+        return text
+    m = _URL_IN_TEXT.search(text)
+    return m.group(0).rstrip('.,;') if m else text.strip()
 
 
 # ===================== 网络 =====================
@@ -90,7 +114,11 @@ def fetch_html(url: str, cookie: str = "") -> str:
                     urllib.request.ProxyHandler({})) if direct else urllib.request.build_opener()
                 req = urllib.request.Request(url, headers=headers)
                 with opener.open(req, timeout=30) as r:
-                    return _decode_html(r.read(), r.headers.get("Content-Type", ""))
+                    raw = r.read()
+                    # 处理 gzip 压缩（urllib 不自动解压 Content-Encoding: gzip）
+                    if r.headers.get("Content-Encoding", "").lower() == "gzip":
+                        raw = _gz.decompress(raw)
+                    return _decode_html(raw, r.headers.get("Content-Type", ""))
             except Exception as e:
                 last_err = e
                 time.sleep(1.0 * (attempt + 1))
@@ -177,23 +205,52 @@ def download_image(url: str):
 
 # ===================== 提取 =====================
 def extract_wechat(html: str):
-    """微信公众号：提取 mmbiz.qpic.cn 图片 URL（PNG/JPEG 均匹配），去 query。"""
-    pat = re.compile(r'data-src="(https?://[^"]*?mmbiz[^"]*?wx_fmt=(?:png|jpeg)[^"]*)"')
-    urls = [u.split("?")[0] for u in pat.findall(html)]
-    return list(dict.fromkeys(urls))  # 去重保序
+    """微信公众号：提取 mmbiz.qpic.cn 图片 URL（PNG/JPEG 均匹配），去 query。
+    兼容两种形态：
+      ① 老式：https://mmbiz.qpic.cn/xxx?wx_fmt=png（带 query 参数）
+      ② 新式：https://mmbiz.qpic.cn/mmbiz_jpg/xxx/640（形如 mmbiz_jpg/mmbiz_png/mmbiz_gif，无 query）
+    排除 gif 动图与 JS 模板（src 为 .concat 拼接的模板行）。"""
+    out = []
+    for u in re.findall(r'data-src="(https?://[^"]*?)"', html):
+        u = u.split("?")[0]
+        if "mmbiz" not in u:
+            continue
+        # 模板行（'.concat(...)'）无真实 URL，跳过
+        if u.startswith("'") or ".concat" in u or "')" in u:
+            continue
+        # 新式：mmbiz_jpg/mmbiz_png/mmbiz_bmp/mmbiz_webp（去掉 gif 动图）
+        if re.search(r"mmbiz_(?:jpg|jpeg|png|bmp|webp|wjpeg)/", u, re.I):
+            if u not in out:
+                out.append(u)
+    return out
 
 
 def extract_tan8(html: str):
     """弹琴吧：提取隐藏的高清标准版曲谱 URL（*_standard/ 目录）。
     页面把图片 URL 放在 JS 数组（yuepuArrXian 五线谱 / yuepuArrJian 简谱）里，
-    JSON 序列化后斜杠带 \\/ 转义（https:\\/\\/oss.tan8.com\\/...），两种形态都要匹配。"""
-    pat = re.compile(
-        r'https?:\\?/\\?/oss\.tan8\.com\\?/yuepuku\\?/\d+\\?/\d+\\?/\d+_\w+_standard\\?/\d+_\w+\.ypad\.\d+\.png')
+    JSON 序列化后斜杠带 \\/ 转义（https:\\/\\/oss.tan8.com\\/...），两种形态都要匹配。
+
+    格式变迁（2026-08 实测）：
+      老：.../115372_xxx_standard/115372_xxx.ypad.0.png（文件名含 .ypad.）
+      新：.../115372_ejjadhjd_standard/prev_115372.0.png（无 .ypad，前缀 prev_）
+      另有 _jianpu 目录（简谱），排除。
+    → 统一按「_standard 目录 + .png 结尾」匹配，文件名形态不限。"""
     urls = []
-    for u in pat.findall(html):
-        u = u.replace("\\/", "/")
-        if u not in urls:
-            urls.append(u)
+    pats = [
+        # 主通道：新/老格式通用（_standard 目录下的 png）
+        r'https?:\\?/\\?/oss\.tan8\.com\\?/yuepuku\\?/\d+\\?/\d+\\?/\d+_\w+_standard\\?/[^\s"\'<>\\]+\.png',
+        # 兜底：老格式（文件名含 .ypad.）
+        r'https?:\\?/\\?/oss\.tan8\.com\\?/yuepuku\\?/\d+\\?/\d+\\?/\d+_\w+_standard\\?/\d+_\w+\.ypad\.\d+\.png',
+    ]
+    for p in pats:
+        for u in re.findall(p, html):
+            u = u.replace("\\/", "/")
+            # 修正重复斜杠（jianpu 目录后可能出现 //）
+            u = re.sub(r'(?<!:)//+', '/', u)
+            if u not in urls:
+                urls.append(u)
+        if urls:
+            break
     return urls
 
 
@@ -226,6 +283,277 @@ def _ktvc8_imgs(html: str):
         if u not in out:
             out.append(u)
     return out
+
+
+def _get_captcha_ocr():
+    """惰性加载验证码专用 OCR（ddddocr 优先，rapidocr 兜底）。
+    ddddocr 专为验证码训练（数字识别率高），但打包体积 +20MB；
+    缺失时退回 rapidocr（通用 OCR，对细笔画验证码可能识别失败）。"""
+    global _CAPTCHA_OCR
+    if _CAPTCHA_OCR is None:
+        try:
+            import ddddocr
+            _CAPTCHA_OCR = ("dddd", ddddocr.DdddOcr(show_ad=False))
+        except Exception:
+            _CAPTCHA_OCR = ("rapid", _get_ocr_engine())
+    return _CAPTCHA_OCR
+
+
+def _ocr_guess_multi(kind, ocr, b64_bytes):
+    """验证码 OCR → 候选答案列表。ddddocr 吃原始字节；rapidocr 需要 ndarray。"""
+    import re as _re
+    if kind == "dddd":
+        try:
+            t = str(ocr.classification(b64_bytes)).strip()
+            return [t] if len(t) >= 3 else []
+        except Exception:
+            return []
+    try:
+        import numpy as np
+        from PIL import Image
+        img = Image.open(io.BytesIO(b64_bytes)).convert("L")
+        arr = np.array(img)
+        result, _ = ocr(arr)
+        if not result:
+            return []
+        def _conf(r):
+            try:
+                return float(r[2])
+            except Exception:
+                return 0.0
+        boxes = [(r[0], str(r[1]), _conf(r)) for r in result if len(r) >= 3]
+        boxes.sort(key=lambda b: b[0][0][0])
+        text = _re.sub(r"\s+", "", "".join(b[1] for b in boxes)).strip()
+        return [text] if len(text) >= 3 else []
+    except Exception:
+        return []
+
+
+def _ktvc8_solve_waf(url: str, cookie: str = "", manual_ans: str = "") -> tuple:
+    """词曲网云锁 WAF 自动验证：OCR 识别 base64 验证码 → 十六进制编码 → 提交取真实页面。
+    通道优先级：
+      1) manual_ans 非空（前端弹窗用户手输）→ 用全新会话取验证码图，再用同一会话提交；
+      2) ddddocr 自动识别 → rapidocr 兜底 → 失败换新验证码重试（最多 4 轮）；
+      3) 全部失败 → 返回 ("__CAPTCHA_REQUIRED__:<path>", "")，前端弹窗让用户手输。
+    关键：验证码图与提交必须同一 CookieJar 会话（跨会话提交会失效）。
+    返回 (real_html, session_cookie)；彻底失败返回 ("", "")。"""
+    import gzip as _gz
+    import http.cookiejar as _cj
+    try:
+        from PIL import Image
+    except Exception:
+        Image = None
+
+    def _mk_jar():
+        jar = _cj.CookieJar()
+        ctx = __import__("ssl").create_default_context()
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+            urllib.request.HTTPSHandler(context=ctx),
+            urllib.request.HTTPCookieProcessor(jar))
+        headers = {"User-Agent": UA, "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+                   "Accept-Encoding": "gzip, deflate"}
+        if cookie:
+            headers["Cookie"] = normalize_cookie(cookie)
+        return jar, opener, headers
+
+    # 单会话内：取 WAF 页 → 候选答案（guesses_source 回调）→ 提交。成功返回 (html, cookie, None)
+    def _attempt_round(guesses_source):
+        jar, opener, headers = _mk_jar()
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with opener.open(req, timeout=30) as r:
+                waf_data = r.read()
+                if r.headers.get("Content-Encoding", "").lower() == "gzip":
+                    waf_data = _gz.decompress(waf_data)
+            waf_html = waf_data.decode("utf-8", errors="ignore")
+        except Exception:
+            return (None, None, None)
+        if not is_waf_page(waf_html):
+            session_cookie = "; ".join(f"{c.name}={c.value}" for c in jar)
+            return (waf_html, session_cookie, None)
+        m = re.search(r'data:image/bmp;base64,([^"\s]+)', waf_html)
+        if not m:
+            return (None, None, None)
+        b64_str = m.group(1) + "=" * ((4 - len(m.group(1)) % 4) % 4)
+        captcha_bytes = _b64.b64decode(b64_str)
+        guesses = guesses_source(captcha_bytes, jar, opener, headers)
+        # 提交循环（同一 jar）
+        for text in guesses:
+            hex_text = "".join(f"{ord(c):x}" for c in text)
+            sep = "&" if "?" in url else "?"
+            verify_url = f"{url}{sep}security_verify_img={hex_text}"
+            srcurl_hex = "".join(f"{ord(c):x}" for c in url)
+            jar.set_cookie(_cj.Cookie(
+                version=0, name='srcurl', value=srcurl_hex,
+                port=None, port_specified=False,
+                domain='.ktvc8.com', domain_specified=True, domain_initial_dot=True,
+                path='/', path_specified=True, secure=True,
+                expires=None, discard=True, comment=None, comment_url=None, rest={}, rfc2109=False))
+            try:
+                req2 = urllib.request.Request(verify_url, headers=headers)
+                with opener.open(req2, timeout=30) as r:
+                    real_data = r.read()
+                    if r.headers.get("Content-Encoding", "").lower() == "gzip":
+                        real_data = _gz.decompress(real_data)
+                real_html = real_data.decode("utf-8", errors="ignore")
+            except Exception:
+                continue
+            redirect_m = re.search(r'self\.location\s*=\s*["\']([^"\']+)["\']', real_html)
+            if redirect_m:
+                redirect_url = redirect_m.group(1)
+                if redirect_url.startswith("/"):
+                    from urllib.parse import urlparse as _up
+                    parsed = _up(url)
+                    redirect_url = f"{parsed.scheme}://{parsed.netloc}{redirect_url}"
+                try:
+                    req3 = urllib.request.Request(redirect_url, headers=headers)
+                    with opener.open(req3, timeout=30) as r:
+                        final_data = r.read()
+                        if r.headers.get("Content-Encoding", "").lower() == "gzip":
+                            final_data = _gz.decompress(final_data)
+                        real_html = final_data.decode("utf-8", errors="ignore")
+                except Exception:
+                    pass
+            if not is_waf_page(real_html):
+                session_cookie = "; ".join(f"{c.name}={c.value}" for c in jar)
+                print(f"[WAF] 验证码提交成功（{text} → {hex_text}）")
+                return (real_html, session_cookie, None)
+        # 未破 → 返回验证码字节（供保存弹窗）
+        return (None, None, captcha_bytes)
+
+    # ③ @ask 模式：单会话取图 → 打印 __CAPTCHA_SHOW__ 标记 → 等前端写答案文件 → 同会话提交
+    if manual_ans == "@ask":
+        answer_file = os.path.join(tempfile.gettempdir(), "score_ktvc8_answer.txt")
+        try:
+            if os.path.exists(answer_file):
+                os.remove(answer_file)
+        except Exception:
+            pass
+
+        def _ask(cap_bytes, jar, opener, headers):
+            try:
+                cap_path = os.path.join(tempfile.gettempdir(), "score_ktvc8_captcha.png")
+                if Image is not None:
+                    Image.open(io.BytesIO(cap_bytes)).convert("RGB").save(cap_path)
+                else:
+                    with open(cap_path, "wb") as f:
+                        f.write(cap_bytes)
+            except Exception as e:
+                print(f"[warn] 验证码保存失败: {e}")
+                return []
+            # 通知前端弹窗（stdout 会被 Tauri 捕获为 log/error）
+            print(f"__KTVC8_CAPTCHA_SHOW__:{cap_path}", flush=True)
+            deadline = time.time() + 180
+            while time.time() < deadline:
+                if os.path.exists(answer_file):
+                    try:
+                        with open(answer_file, "r", encoding="utf-8") as f:
+                            t = f.read().strip()
+                        if t:
+                            if t == "__CANCEL__":
+                                return []
+                            return [t]
+                    except Exception:
+                        pass
+                time.sleep(0.5)
+            return []
+        out = _attempt_round(_ask)
+        if out and out[0]:
+            return (out[0], out[1])
+        return "", ""
+
+    # ① 自动模式（无手动答案）
+    if not manual_ans:
+        last_cap = None
+        for _ in range(4):
+            def _auto(cap_bytes, jar, opener, headers):
+                kind, ocr = _get_captcha_ocr()
+                if ocr is None:
+                    return []
+                return _ocr_guess_multi(kind, ocr, cap_bytes)
+            out = _attempt_round(_auto)
+            if out and out[0]:
+                return (out[0], out[1])
+            if out and out[2]:
+                last_cap = out[2]
+        cap_bytes = last_cap
+    else:
+        # ② 手动答案已给出（前端弹窗后重跑）：单会话取图 → 用答案提交
+        ans = manual_ans.strip()
+
+        def _manual(cap_bytes, jar, opener, headers):
+            return [ans] if len(ans) >= 3 else []
+        out = _attempt_round(_manual)
+        if out and out[0]:
+            return (out[0], out[1])
+        cap_bytes = out[2] if out else None
+    if cap_bytes is None:
+        return "", ""
+    try:
+        tmp_dir = tempfile.gettempdir()
+        cap_path = os.path.join(tmp_dir, "score_ktvc8_captcha.png")
+        if Image is not None:
+            Image.open(io.BytesIO(cap_bytes)).convert("RGB").save(cap_path)
+        else:
+            with open(cap_path, "wb") as f:
+                f.write(cap_bytes)
+        print(f"[WAF] 验证码自动识别失败，已保存到 {cap_path}")
+        return (f"__CAPTCHA_REQUIRED__:{cap_path}", "")
+    except Exception as e:
+        print(f"[warn] 验证码保存失败: {e}")
+    return "", ""
+
+
+def _ktvc8_showvisit_imgs(page_html: str, cookie: str = "") -> list:
+    """词曲网新结构（2026-09 起）：谱图不再写进 HTML，而是由页面内联脚本
+    `show_neirong(yid)` 动态注入；真正的图片 URL 藏在
+    `/showvisitjs.asp?ID=<yid>&uID=<uid>` 返回的 JS 里（同页 <script src> 引用的那个）。
+
+    该子资源受 `/plcms.asp` 滑动验证保护——但验证形同虚设：滑块脚本在拖到底后只发一个
+    `GET /plcms.asp?action=verify_pass&t=<ms>`，服务端即回 ok 并下发
+    SITE_VERIFY_PASSED cookie。故纯 HTTP 直调即可，无需浏览器。
+
+    返回图片绝对 URL 列表（按页序）；不适用/失败返回 []。
+    """
+    import http.cookiejar as _cj
+    m = re.search(r'showvisitjs\.asp\?ID=(\d+)(?:&(?:amp;)?uID=(\d+))?', page_html)
+    if not m:
+        return []
+    yid, uid = m.group(1), m.group(2) or "0"
+    base = "https://www.ktvc8.com"
+    try:
+        jar = _cj.CookieJar()
+        ctx = __import__("ssl").create_default_context()
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+            urllib.request.HTTPSHandler(context=ctx),
+            urllib.request.HTTPCookieProcessor(jar))
+
+        def _get(u, referer):
+            h = {"User-Agent": UA, "Referer": referer, "Accept": "*/*"}
+            if cookie:
+                h["Cookie"] = normalize_cookie(cookie)
+            with opener.open(urllib.request.Request(u, headers=h), timeout=25) as r:
+                return r.read()
+
+        # 过滑动验证（直调 verify_pass，服务端只认这个参数）
+        _get(f"{base}/plcms.asp?action=verify_pass&t={int(time.time() * 1000)}",
+             referer=f"{base}/article/article_{yid}_1.html")
+        js_raw = _get(f"{base}/showvisitjs.asp?ID={yid}&uID={uid}",
+                      referer=f"{base}/article/article_{yid}_1.html")
+        js = js_raw.decode("gb18030", "ignore")
+        # 谱图是 ../uploadfiles/... 相对路径；排除站内图标（../images/*.png）
+        rels = re.findall(r"\.\./(?!images/)[^\"'\\\s]+?\.(?:png|jpg|jpeg)", js, re.I)
+        out = []
+        for r0 in rels:
+            full = f"{base}/{r0.replace('../', '').lstrip('/')}"
+            if full not in out:
+                out.append(full)
+        return out
+    except Exception as e:
+        print(f"[warn] 词曲网 showvisitjs 通道失败: {e}")
+        return []
 
 
 def _ktvc8_fetch_js(url: str, cookie: str = "") -> tuple:
@@ -291,17 +619,26 @@ def extract_ktvc8(html: str):
 
 
 def ktvc8_title(html: str) -> str:
-    """从词曲网 <title> 提取干净曲名（形如「《耳朵 李荣浩 独奏版》…」→「耳朵 李荣浩 独奏版」）。"""
+    """从词曲网 <title> 提取干净曲名（形如「《耳朵 李荣浩 独奏版》…」→「耳朵 李荣浩 独奏版」）。
+    若书名号内只有曲名、歌手写在号外（如「《归来兮》钢琴谱 - 庆庆演唱」，新结构常见），
+    则补成「曲名-歌手」。"""
     m = re.search(r'<title>([^<]+)</title>', html, re.I)
     if not m:
         return ""
-    t = html_mod.unescape(m.group(1)).strip()
+    raw = html_mod.unescape(m.group(1)).strip()
+    t = raw
     # 剥书名号壳：完整的《...》→ 内部文字
     m2 = re.search(r'《([^》]+)》', t)
     if m2:
         t = m2.group(1)
     for noise in ("钢琴谱", "曲谱", "简谱", "歌谱", "独奏版", " - 词曲网", "词曲网"):
         t = t.split(noise)[0]
+    t = t.strip(" -_（）()　·,，")[:60]
+    # 号外歌手补全：书名号内无空格（未带歌手）时，从 title 的「- XXX演唱」取歌手
+    if t and " " not in t:
+        ma = re.search(r'[-–—]\s*([^\s\-–—<《》]+?)\s*演唱', raw)
+        if ma and ma.group(1):
+            t = f"{t}-{ma.group(1)}"
     return t.strip(" -_（）()　·,，")[:60]
 
 
@@ -470,41 +807,381 @@ def _find_ccmz_engine() -> str:
     return ""
 
 
-def process_ccmz(input_str: str, output_dir: str) -> str:
-    """虫虫链接 → 下载 ccmz → 调引擎 → 返回成品 PDF 路径（或抛错）。"""
+# ---------- ccmz → MusicXML（纯 Python，无外部依赖）----------
+# 移植自 ccmz-score-convert/scripts/ccmz2mxl.py。要点：
+#   * 同 tick 多 elems → 和弦（<chord/>）
+#   * 同 staff 多 voice → 顺序输出，之间以 <backup> 复位
+#   * 时值以相邻 tick 实差为准（正确覆盖三连音）
+#   * note 子元素严格按 MusicXML DTD 顺序（staff 必须在 notations 之前，否则 MuseScore 段错误）
+CCMZ_PB = 480
+_CCMZ_STEP = {1: 'C', 2: 'D', 3: 'E', 4: 'F', 5: 'G', 6: 'A', 7: 'B'}
+_CCMZ_TYPE = {1: 'whole', 2: 'half', 4: 'quarter', 8: 'eighth',
+              16: '16th', 32: '32nd', 64: '64th'}
+
+
+def _ccmz_zip(path: str):
+    """ccmz → zipfile：首字节为版本标记（2 = 载荷逐字节 XOR 1）。"""
+    import io as _io
+    import zipfile as _zip
+    raw = open(path, 'rb').read()
+    if not raw:
+        raise ValueError("ccmz 文件为空")
+    payload = bytes(x ^ 1 for x in raw[1:]) if raw[0] == 2 else raw[1:]
+    if payload[:2] != b'PK':
+        raise ValueError(f"ccmz 解码后不是 ZIP（版本标记={raw[0]}）")
+    return _zip.ZipFile(_io.BytesIO(payload))
+
+
+def _ccmz_note_ticks(type_, dots) -> int:
+    base = 4 * CCMZ_PB // type_
+    tot = float(base)
+    add = base / 2.0
+    for _ in range(dots or 0):
+        tot += add
+        add /= 2.0
+    return int(round(tot))
+
+
+def _ccmz_ticks_to_typenote(t: int):
+    best = None
+    for type_ in (1, 2, 4, 8, 16, 32):
+        for dots in (0, 1, 2):
+            d = abs(_ccmz_note_ticks(type_, dots) - t)
+            if best is None or d < best[0]:
+                best = (d, type_, dots)
+    return best[1], best[2]
+
+
+def _ccmz_measure_total(m: dict) -> int:
+    t = m.get('time') or {'beats': 4, 'beatu': 4}
+    return int(CCMZ_PB * 4 * t.get('beats', 4) / t.get('beatu', 4))
+
+
+def _ccmz_tuplet_of(n: dict):
+    for e in (n.get('elems') or []):
+        for p in (e.get('pairs') or []):
+            if p.get('type') == 'tuplet':
+                return p.get('value', 3)
+    return None
+
+
+def _ccmz_elem_lyric(e: dict) -> str:
+    """elem 上可能挂的歌词（虫虫多数谱无词，字段名做多形态容错）。"""
+    for k in ('lyric', 'word', 'text', 'name'):
+        v = e.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+
+def _ccmz_notes_xml(ns, dur, type_, dots, tup, staff_no, voice_no):
+    """同 tick 的 note 列表 → 一个和弦的 xml 行"""
+    x = []
+    elems = []
+    for n in ns:
+        for e in (n.get('elems') or []):
+            elems.append(e)
+    for i, e in enumerate(elems):
+        x.append('<note>')
+        if i > 0:
+            x.append('<chord/>')
+        step = _CCMZ_STEP.get(e.get('step'), 'C')
+        alter = e.get('alter', 0) or 0
+        octv = e.get('octave', 4)
+        x.append(f'<pitch><step>{step}</step>'
+                 + (f'<alter>{alter}</alter>' if alter else '')
+                 + f'<octave>{octv}</octave></pitch>')
+        x.append(f'<duration>{dur}</duration>')
+        pairs = e.get('pairs') or []
+        t_start = any(p.get('type') == 'tied' for p in pairs)
+        t_stop = e.get('tied') == 'end'
+        if t_start:
+            x.append('<tie type="start"/>')
+        if t_stop:
+            x.append('<tie type="stop"/>')
+        x.append(f'<voice>{voice_no}</voice>')
+        x.append(f'<type>{_CCMZ_TYPE.get(type_, "quarter")}</type>')
+        for _ in range(dots or 0):
+            x.append('<dot/>')
+        acc = e.get('acc')
+        if acc:
+            an = acc.get('acc') if isinstance(acc, dict) else acc
+            anm = {'Sharp': 'sharp', 'Flat': 'flat', 'Natural': 'natural',
+                   'DoubleSharp': 'double-sharp', 'DoubleFlat': 'flat-flat'}.get(an)
+            if anm:
+                x.append(f'<accidental>{anm}</accidental>')
+        if tup:
+            x.append(f'<time-modification><actual-notes>{tup}</actual-notes>'
+                     f'<normal-notes>{tup - 1}</normal-notes></time-modification>')
+        x.append(f'<staff>{staff_no}</staff>')
+        notx = []
+        if t_start:
+            notx.append('<tied type="start"/>')
+        if t_stop:
+            notx.append('<tied type="stop"/>')
+        if tup:
+            notx.append('<tuplet type="start" number="1"/>')
+        if notx:
+            x.append('<notations>' + ''.join(notx) + '</notations>')
+        # 歌词（MusicXML DTD 顺序里 lyric 位于 notations 之后）
+        lyr = _ccmz_elem_lyric(e)
+        if lyr:
+            x.append('<lyric number="1"><syllabic>single</syllabic>'
+                     f'<text>{escape(lyr)}</text></lyric>')
+        x.append('</note>')
+    return x
+
+
+def _ccmz_rest_xml(dur, type_, dots, staff_no, voice_no, tup=None):
+    x = ['<note><rest/>']
+    x.append(f'<duration>{dur}</duration>')
+    x.append(f'<voice>{voice_no}</voice>')
+    x.append(f'<type>{_CCMZ_TYPE.get(type_, "quarter")}</type>')
+    for _ in range(dots or 0):
+        x.append('<dot/>')
+    if tup:
+        x.append(f'<time-modification><actual-notes>{tup}</actual-notes>'
+                 f'<normal-notes>{tup - 1}</normal-notes></time-modification>')
+    x.append(f'<staff>{staff_no}</staff></note>')
+    return x
+
+
+def _ccmz_render_voice(m, notes, staff_no, voice_no):
+    """一个 voice 内的全部音符/休止 → xml（空缺补休止，尾部补齐）"""
+    total = _ccmz_measure_total(m)
+    groups = []
+    for n in sorted(notes, key=lambda x: x.get('tick', 0)):
+        t = n.get('tick', 0)
+        if groups and groups[-1][0] == t:
+            groups[-1][1].append(n)
+        else:
+            groups.append((t, [n]))
+    x = []
+    cursor = 0
+    for gi, (tick, ns) in enumerate(groups):
+        if tick > cursor:
+            rt, rd = _ccmz_ticks_to_typenote(tick - cursor)
+            x.extend(_ccmz_rest_xml(tick - cursor, rt, rd, staff_no, voice_no))
+            cursor = tick
+        nxt = groups[gi + 1][0] if gi + 1 < len(groups) else total
+        dur = nxt - tick
+        if dur <= 0:
+            continue
+        head = ns[0]
+        tup = _ccmz_tuplet_of(head)
+        if tup:
+            type_, dots = head.get('type', 8), head.get('dots', 0)
+        else:
+            type_, dots = _ccmz_ticks_to_typenote(dur)
+        if 'elems' not in head or 'rest' in head:
+            x.extend(_ccmz_rest_xml(dur, type_, dots, staff_no, voice_no, tup))
+        else:
+            x.extend(_ccmz_notes_xml(ns, dur, type_, dots, tup, staff_no, voice_no))
+        cursor = tick + dur
+    if cursor < total:
+        rt, rd = _ccmz_ticks_to_typenote(total - cursor)
+        x.extend(_ccmz_rest_xml(total - cursor, rt, rd, staff_no, voice_no))
+    return x
+
+
+def _ccmz_render_measure(m, out, staff_filter, is_first):
+    total = _ccmz_measure_total(m)
+    out.append(f'<measure number="{escape(str(m.get("num", "1")))}">')
+    need = (is_first or m.get('fifths') is not None
+            or m.get('time') is not None or m.get('clefs') is not None)
+    if need:
+        out.append('<attributes>')
+        if is_first:
+            out.append(f'<divisions>{CCMZ_PB}</divisions>')
+        if is_first or m.get('fifths') is not None:
+            f = m.get('fifths')
+            f = (f.get('fifths') if isinstance(f, dict) else f) or 0
+            out.append(f'<key><fifths>{f}</fifths></key>')
+        if is_first or m.get('time') is not None:
+            t = m.get('time') or {'beats': 4, 'beatu': 4}
+            out.append(f'<time><beats>{t.get("beats", 4)}</beats>'
+                       f'<beat-type>{t.get("beatu", 4)}</beat-type></time>')
+        if is_first and staff_filter is None:
+            out.append('<staves>2</staves>')
+        for c in ((m.get('clefs') or []) if is_first else []):
+            sn = c.get('staff', 1)
+            if staff_filter is not None and sn != staff_filter:
+                continue
+            sign, line = ('G', 2) if c.get('clef') == 'Treble' else ('F', 4)
+            ono = 1 if staff_filter is not None else sn
+            out.append(f'<clef number="{ono}"><sign>{sign}</sign><line>{line}</line></clef>')
+        out.append('</attributes>')
+    if is_first:
+        for d in (m.get('dirs') or []):
+            if d.get('type') == 'metronome':
+                bpm = d.get('value', '76')
+                out.append(f'<direction placement="above"><direction-type>'
+                           f'<metronome><beat-unit>quarter</beat-unit>'
+                           f'<per-minute>{bpm}</per-minute></metronome></direction-type>'
+                           f'<sound tempo="{bpm}"/></direction>')
+
+    by_staff = {}
+    for n in m['notes']:
+        st = n.get('staff', 1)
+        if staff_filter is not None and st != staff_filter:
+            continue
+        by_staff.setdefault(st, []).append(n)
+
+    staves = sorted(by_staff.keys()) or [staff_filter or 1]
+    first_block = True
+    for st in staves:
+        by_voice = {}
+        for n in by_staff.get(st, []):
+            by_voice.setdefault(n.get('v') or 0, []).append(n)
+        if not by_voice:
+            by_voice = {0: []}
+        ono = 1 if staff_filter is not None else st
+        first_voice = True
+        for vi, v in enumerate(sorted(by_voice.keys())):
+            if not (first_block and first_voice):
+                out.append(f'<backup><duration>{total}</duration></backup>')
+            first_block = False
+            first_voice = False
+            body = _ccmz_render_voice(m, by_voice[v], ono, vi + 1)
+            if not body:
+                rt, rd = _ccmz_ticks_to_typenote(total)
+                body = _ccmz_rest_xml(total, rt, rd, ono, vi + 1)
+            out.extend(body)
+    out.append('</measure>')
+
+
+def ccmz_to_musicxml(ccmz_path: str, staff: int = 1, title: str = "") -> tuple:
+    """ccmz → MusicXML 文本。返回 (xml, 元信息 dict)。
+
+    staff=1 即「只留第一行单轨」（虫虫钢琴右手旋律声部）。
+    """
+    import json as _json
+    z = _ccmz_zip(ccmz_path)
+    score = _json.loads(z.read('score.json').decode('utf-8'))
+    part = score['parts'][0]
+    tinfo = score.get('title') or {}
+    tname = title or tinfo.get('title') or 'Untitled'
+    composer_raw = (tinfo.get('composer') or '').replace('\n', '；')
+    composer = composer_raw.replace('；', ' / ')
+
+    out = ['<?xml version="1.0" encoding="UTF-8"?>',
+           '<!DOCTYPE score-partwise PUBLIC "-//Recordare//DTD MusicXML 4.0 Partwise//EN" '
+           '"http://www.musicxml.org/dtds/partwise.dtd">',
+           '<score-partwise version="4.0">',
+           f'<movement-title>{escape(tname)}</movement-title>',
+           '<identification>']
+    if composer:
+        out.append(f'<creator type="composer">{escape(composer)}</creator>')
+    out.append('<encoding><software>score-studio ccmz2mxl</software></encoding></identification>')
+    out.append('<part-list><score-part id="P1"><part-name>Violin</part-name>'
+               '</score-part></part-list>')
+    out.append('<part id="P1">')
+    for i, mraw in enumerate(part['measures']):
+        _ccmz_render_measure(mraw, out, staff, is_first=(i == 0))
+    out.append('</part></score-partwise>')
+
+    meta = {
+        'title': tname,
+        'composer_raw': composer_raw,
+        'singer': _ccmz_pick_singer(composer_raw),
+        'measures': len(part['measures']),
+        'names': z.namelist(),
+    }
+    return '\n'.join(out), meta
+
+
+def _ccmz_pick_singer(composer_raw: str) -> str:
+    """从「艺术家/歌手：XXX」行提取歌手（虫虫把歌手写在 title.composer 里）。"""
+    for line in re.split(r'[；\n]', composer_raw or ''):
+        m = re.search(r'(?:艺术家|歌手|演唱|演奏)\s*[/、]?\s*(?:歌手)?\s*[:：]\s*(.+)', line)
+        if m:
+            return m.group(1).strip(' 　·,，')
+    return ""
+
+
+def _ccmz_pdf_node_engine(ccmz_path: str, out: str) -> bool:
+    """降级通道：Node + puppeteer 引擎出「完整双谱表」版（MuseScore 缺失时兜底）。"""
+    engine = _find_ccmz_engine()
+    node = _find_node() if engine else ""
+    if not engine or not node:
+        return False
+    node, engine = _clean_win_path(node), _clean_win_path(engine)
+    ccmz_path, out = _clean_win_path(ccmz_path), _clean_win_path(out)
+    cmd = [node, engine, ccmz_path, out, str(49200 + (os.getpid() % 100))]
+    eng_dir = os.path.dirname(engine)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=180, cwd=eng_dir)
+    except Exception as e:
+        print(f"[ccmz] Node 引擎调用异常：{e}")
+        return False
+    if proc.returncode != 0 or not os.path.isfile(out):
+        err = (proc.stderr or b"").decode("utf-8", "ignore")[:300]
+        print(f"[ccmz] Node 引擎失败：{err or '无输出'}")
+        return False
+    return True
+
+
+def process_ccmz(input_str: str, output_dir: str, custom: str = "") -> str:
+    """虫虫链接 → 单行单轨（第一行旋律）矢量 PDF，与酷狗 pulu 同规范。
+
+    链路：页面取 ccmz URL → 下载 → 解包 score.json → 转单行 MusicXML（staff 1）
+          → MuseScore 无头排版 → PDF
+    MuseScore 缺失时降级 Node 引擎（完整双谱表版，并明确提示规范不一致）。
+    """
     html_text = fetch_html(input_str)
     ccmz_url = _extract_ccmz_url(html_text)
     if not ccmz_url:
         raise ValueError("未在页面中找到 ccmz 工程文件（可能该曲谱无 ccmz）")
-    engine = _find_ccmz_engine()
-    if not engine:
-        raise ValueError("未找到 ccmz 渲染引擎（软件资源缺失 ccmz-engine），请更新软件")
-    # 下载 ccmz 到临时
     tmpdir = tempfile.mkdtemp(prefix="ccmz_")
     try:
         ccmz_path = os.path.join(tmpdir, "score.ccmz")
         with open(ccmz_path, "wb") as f:
             f.write(download_bytes(ccmz_url))
-        # 干净输出名：页标题 → 去书名号壳
         os.makedirs(output_dir, exist_ok=True)
-        title = piastudy_title(html_text) or "虫虫曲谱"
-        out = os.path.join(output_dir, title + ".pdf")
-        # 调 Node 引擎
-        node = _find_node()
-        if not node:
-            raise ValueError("未找到 Node.js 运行时（ccmz 渲染需 Node，或已内置但未检测到）")
-        # 统一剥 \\?\ 前缀（Tauri 环境路径可能带长路径前缀，Node/subprocess 解析异常）
-        node, engine = _clean_win_path(node), _clean_win_path(engine)
-        ccmz_path, out = _clean_win_path(ccmz_path), _clean_win_path(out)
-        cmd = [node, engine, ccmz_path, out, str(49200 + (os.getpid() % 100))]
-        # 显式指定 cwd=引擎目录：Node 的模块解析依赖 cwd，
-        # 安装目录含空格（如 D:\Program Files\Score Studio）时若不指定会报 lstat 'D:' 类路径解析错误
-        eng_dir = os.path.dirname(engine)
-        proc = subprocess.run(cmd, capture_output=True, timeout=180, cwd=eng_dir)
-        if proc.returncode != 0 or not os.path.isfile(out):
-            err = (proc.stderr or b"").decode("utf-8", "ignore")[:400]
-            raise ValueError(f"ccmz 渲染失败: {err or '无输出'}（cmd: {' '.join(cmd)}）")
-        print(f"✅ PDF 已生成：{out}（虫虫完整版）")
+        page_title = piastudy_title(html_text) or "虫虫曲谱"
+
+        ms = find_musescore()
+        if not ms:
+            print("[ccmz] ⚠ 未找到 MuseScore，降级为 Node 引擎（完整双谱表版，非单行规范）")
+            out_full = os.path.join(output_dir, safe_name(page_title) + ".pdf")
+            if _ccmz_pdf_node_engine(ccmz_path, out_full):
+                print(f"✅ PDF 已生成：{out_full}（虫虫完整版 · 降级通道）")
+                return out_full
+            raise ValueError(
+                "虫虫谱排版失败：未找到 MuseScore（推荐，出单行小提琴版），"
+                "Node 渲染引擎兜底也失败。\n"
+                "请安装 MuseScore 4：https://musescore.org/zh-hans/download\n"
+                "装好后本软件会自动识别，无需配置；也可用环境变量 SCORE_MUSESCORE 指定路径。")
+        print(f"[ccmz] 排版引擎：{ms}")
+
+        xml, meta = ccmz_to_musicxml(ccmz_path, staff=1, title=custom)
+        song = meta['title']
+        singer = meta['singer']
+        print(f"[ccmz] 曲名={song} · 歌手={singer or '-'} · 小节={meta['measures']} · 取第 1 行（右手旋律）")
+
+        xml_tmp = os.path.join(tmpdir, "score.musicxml")
+        with open(xml_tmp, 'w', encoding='utf-8', newline='') as f:
+            f.write(xml)
+
+        stem = f"{song}-{singer}" if singer else song
+        out = os.path.join(output_dir, safe_name(f"{stem}-小提琴") + ".pdf")
+        if not mxl2pdf(ms, xml_tmp, out):
+            raise ValueError(
+                "MuseScore 排版失败（未产出 PDF）。\n"
+                "请确认 MuseScore 能正常启动（首次运行需初始化音源，耗时较长），然后重试。")
+
+        n_note = len(re.findall(r'<note[ >/]', xml))
+        n_lyric = len(re.findall(r'<lyric', xml))
+        n_staff2 = len(re.findall(r'<staff>2</staff>', xml))
+        cn = _pdf_cjk_count(out)
+        print(f"[ccmz] 自检：音符={n_note} 歌词={n_lyric} 第二行残留={n_staff2} PDF汉字={cn}")
+        if n_staff2:
+            raise ValueError(f"自检未通过：谱面仍含 {n_staff2} 处第 2 行（未成功去掉二轨）")
+        if n_lyric == 0:
+            print("[ccmz] 说明：虫虫 ccmz 数据不含歌词（纯钢琴谱源），本谱无词可留")
+        if cn == 0:
+            raise ValueError("自检未通过：PDF 中未检出任何中文（中文字体渲染失败）")
+        print(f"✅ PDF 已生成：{out}（{os.path.getsize(out)} 字节 · 虫虫单行小提琴版）")
         return out
     finally:
         try:
@@ -533,6 +1210,271 @@ def _find_node() -> str:
         if os.path.isfile(c):
             return _clean_win_path(c)
     return ""
+
+
+# ===================== 酷狗 Pulu 曲谱（h5.kugou.com） =====================
+# 分享链接里的 v-<hash> 是前端构建目录，随酷狗发版轮换、旧目录被 CDN 清理 → 旧链接一律 404。
+# 但网关接口与它无关：只要 opernid 有效就能取到谱面 → 直调网关，无视 hash。
+# 本链路产出的是「矢量排版 PDF」（MuseScore），不经过位图管线。
+import hashlib
+
+PULU_SALT = "NVPh5oo715z5DIWAeQlhMDsWXXQV4hwt"
+PULU_API = "https://gateway.kugou.com/opern/v1/detail/info"
+PULU_UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) "
+           "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1")
+PULU_LEVEL = {'0': 'Easy', '2': 'Medium', '1': 'Easy', '3': 'Hard'}
+PULU_WANT_LEVEL = '2'          # 主上钦定：只要 Medium 档（无此档时自动降级并回报）
+
+# 根元素上的前端渲染提示属性（OSMD 用）。非标准，不删 → MuseScore 解析器段错误 rc=139。
+_PULU_OSMD_ATTR = re.compile(r'\s+osmdScoreType="[^"]*"')
+# AI 误识别的「花体踏板」噪声：整块 <direction> 内出现 <pedal> 即删（真人不会 6 层踏板同踩）
+_PULU_PEDAL_DIR = re.compile(
+    r'[ \t]*<direction>\s*(?:(?!</direction>).)*?<pedal(?:(?!</direction>).)*?</direction>\r?\n?',
+    re.S)
+
+
+def _pulu_opener():
+    """酷狗专用 opener：必须禁系统代理（本机代理会拦死请求）。"""
+    import ssl as _ssl
+    ctx = _ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = _ssl.CERT_NONE
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        urllib.request.HTTPSHandler(context=ctx))
+
+
+def _pulu_parse_opernid(url: str) -> str:
+    """分享链接 → opernid（形如 863216734_5_0）。hash 段直接无视。"""
+    from urllib.parse import unquote
+    m = re.search(r'opernid=(\d+_\d+_\d+)', unquote(url or ""))
+    return m.group(1) if m else ""
+
+
+def _pulu_fetch(opern_id: str, instruments: str = '1') -> dict:
+    """网关签名请求：salt + 按 key 升序的 k=v 拼接 + salt → MD5。"""
+    from urllib.parse import quote
+    ct = str(int(time.time() * 1000))
+    mid = hashlib.md5(os.urandom(16)).hexdigest()
+    params = {
+        'appid': '1058', 'clientver': '99999', 'clienttime': ct,
+        'mid': mid, 'uuid': mid, 'dfid': '-',
+        'opern_id': opern_id, 'userid': '0', 'token': '',
+        'instruments': str(instruments), 'srcappid': '2919',
+    }
+    sign_src = PULU_SALT + ''.join(f'{k}={params[k]}' for k in sorted(params)) + PULU_SALT
+    params['signature'] = hashlib.md5(sign_src.encode()).hexdigest()
+    qs = '&'.join(f'{k}={quote(str(v), safe="")}' for k, v in params.items())
+    req = urllib.request.Request(f'{PULU_API}?{qs}', headers={
+        'User-Agent': PULU_UA,
+        'Referer': 'https://h5.kugou.com/',
+        'Accept': 'application/json, text/plain, */*',
+    })
+    with _pulu_opener().open(req, timeout=25) as r:
+        return json.loads(r.read().decode('utf-8'))
+
+
+def _pulu_download(url: str) -> bytes:
+    """下载谱面直链（带时效，拿到即下，不要存 URL）。"""
+    req = urllib.request.Request(url, headers={
+        'User-Agent': PULU_UA, 'Referer': 'https://h5.kugou.com/'})
+    with _pulu_opener().open(req, timeout=90) as r:
+        return r.read()
+
+
+def _pulu_strip_osmd(x: str):
+    """删非标准属性 osmdScoreType。内容零损失，返回 (新文本, 删除数)。"""
+    n = len(_PULU_OSMD_ATTR.findall(x))
+    return _PULU_OSMD_ATTR.sub('', x), n
+
+
+def _pulu_strip_pedal(x: str):
+    """删花体踏板 <direction> 块。返回 (新文本, 删除数)。"""
+    hits = _PULU_PEDAL_DIR.findall(x)
+    if not all('<pedal' in h for h in hits):
+        raise ValueError("踏板清理正则误命中非 pedal 块，已中止（避免损坏谱面）")
+    return _PULU_PEDAL_DIR.sub('', x), len(hits)
+
+
+def _pulu_set_title(x: str, title: str) -> str:
+    """标题规范化：Pulu 原始标题是占位串（如 Piano Solo Score (Medium)），用歌名覆盖。"""
+    if '<work-title>' in x:
+        x = re.sub(r'<work-title>.*?</work-title>', f'<work-title>{title}</work-title>', x, flags=re.S)
+    elif '<work>' in x:
+        x = x.replace('<work>', f'<work><work-title>{title}</work-title>', 1)
+    if '<movement-title>' in x:
+        x = re.sub(r'<movement-title>.*?</movement-title>',
+                   f'<movement-title>{title}</movement-title>', x, flags=re.S)
+    return x
+
+
+def _pulu_keep_first_part(x: str):
+    """只保留第一个 <part>（旋律声部，带歌词）= 小提琴单行版。返回 (新文本, 裁掉数)。
+
+    MusicXML 没有「隐藏非空谱表」的表达，MuseScore 也不行 ——
+    所以要单行只能物理裁掉其余 part（这正是主上要的「只留第一行单轨 + 歌词」）。
+    """
+    ids = re.findall(r'<score-part id="([^"]+)">', x)
+    if len(ids) < 2:
+        return x, 0
+    for pid in ids[1:]:
+        x = re.sub(r'\s*<score-part id="%s">.*?</score-part>' % re.escape(pid), '', x, flags=re.S)
+        x = re.sub(r'\s*<part id="%s">.*?</part>' % re.escape(pid), '', x, flags=re.S)
+    return x, len(ids) - 1
+
+
+def find_musescore() -> str:
+    """定位 MuseScore（矢量排版引擎）。环境变量 SCORE_MUSESCORE 可强制指定。"""
+    exes = ("MuseScore4.exe", "MuseScore3.exe", "MuseScore.exe")
+    cands = []
+    if os.environ.get("SCORE_MUSESCORE"):
+        cands.append(os.environ["SCORE_MUSESCORE"])
+    roots = [os.environ.get("ProgramFiles", r"C:\Program Files"),
+             os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+             os.environ.get("LOCALAPPDATA", "")]
+    for r in roots:
+        if not r:
+            continue
+        for ver in ("MuseScore 4", "MuseScore 3", "MuseScore 4 Nightly"):
+            for exe in exes:
+                cands.append(os.path.join(r, ver, "bin", exe))
+        for exe in exes:                       # 便携版布局
+            cands.append(os.path.join(r, "MuseScore4", "bin", exe))
+    # 与软件同级的 musescore/ 目录（便携分发预留）
+    here = os.path.dirname(os.path.abspath(__file__))
+    for base in (here, os.path.dirname(_clean_win_path(sys.argv[0] or here))):
+        for sub in ("musescore", os.path.join("musescore", "bin")):
+            for exe in exes:
+                cands.append(os.path.join(base, sub, exe))
+    for c in cands:
+        if c and os.path.isfile(_clean_win_path(c)):
+            return _clean_win_path(c)
+    return ""
+
+
+def mxl2pdf(ms: str, xml_path: str, pdf_path: str, timeout: int = 300) -> bool:
+    """MusicXML → PDF（MuseScore CLI 无头）。三件套缺一不可，判据只看产物文件。"""
+    env = dict(os.environ)
+    env['QT_QPA_PLATFORM'] = 'offscreen'     # 缺 → 无 GUI 会话下初始化窗口栈，挂起数分钟
+    env['QT_QPA_FONTDIR'] = os.path.join(     # 缺 → 中文歌词在 PDF 里渲染不出来
+        os.environ.get('SystemRoot', r'C:\Windows'), 'Fonts')
+    if os.path.exists(pdf_path):
+        try:
+            os.remove(pdf_path)
+        except Exception:
+            pass
+    try:
+        subprocess.run([ms, '-o', pdf_path, xml_path], env=env,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=timeout, cwd=os.path.dirname(xml_path))
+    except subprocess.TimeoutExpired:
+        print(f"[pulu] MuseScore 转换超时（{timeout}s）")
+    except Exception as e:
+        print(f"[pulu] MuseScore 调用异常：{e}")
+    return os.path.isfile(pdf_path) and os.path.getsize(pdf_path) > 0
+
+
+def _pdf_cjk_count(pdf_path: str) -> int:
+    """PDF 文本层里的汉字数（0 = 字体没配好）。fitz 不可用时返回 -1（跳过该判据）。"""
+    try:
+        import fitz
+        d = fitz.open(pdf_path)
+        n = sum(1 for p in d for c in p.get_text() if '\u4e00' <= c <= '\u9fff')
+        d.close()
+        return n
+    except Exception:
+        return -1
+
+
+def process_pulu(input_str: str, output_dir: str, custom: str = "") -> str:
+    """酷狗分享链接 → Medium 档「小提琴单行版（含歌词）」矢量 PDF。
+
+    链路：网关签名取直链 → 下载 MusicXML → 清噪（花体踏板 + osmdScoreType）
+          → 裁第一个 part（旋律 + 歌词）→ MuseScore 无头排版 → PDF
+    """
+    opern_id = _pulu_parse_opernid(input_str)
+    if not opern_id:
+        raise ValueError("未在链接中找到 opernid（酷狗曲谱分享链接形如 …/xml.html?opernid=<ID>_<N>_<N>）")
+    instruments = opern_id.split('_')[1] if opern_id.count('_') >= 2 else '1'
+    print(f"[pulu] opernid = {opern_id}（instruments={instruments}）")
+
+    try:
+        js = _pulu_fetch(opern_id, instruments)
+    except Exception as e:
+        raise ValueError(f"酷狗网关请求失败：{e}")
+    if js.get('errcode') not in (0, '0', None):
+        raise ValueError(f"酷狗网关返回错误：errcode={js.get('errcode')} errmsg={js.get('errmsg')!r}")
+
+    data = js.get('data') or {}
+    info = data.get('opern_info') or {}
+    levels = info.get('opern_level_file') or {}
+    if not levels:
+        raise ValueError(
+            "该曲谱在酷狗侧不存在或已下架（接口 data.opern_info 为空）。\n"
+            "换参数无用 —— 请确认分享链接有效，或换一首重新分享。")
+
+    key = PULU_WANT_LEVEL if PULU_WANT_LEVEL in levels else sorted(levels)[0]
+    level = PULU_LEVEL.get(key, f"L{key}")
+    if key != PULU_WANT_LEVEL:
+        print(f"[pulu] ⚠ 该曲无 Medium 档（可用档位：{sorted(levels)}），已降级为 {level}")
+    song = (data.get('song_name') or info.get('opern_name') or '').strip() or '酷狗曲谱'
+    singer = (data.get('singer_name') or info.get('author_name') or '').strip()
+    print(f"[pulu] 曲名={song} · 歌手={singer or '-'} · 档位={level}")
+
+    ms = find_musescore()
+    if not ms:
+        raise ValueError(
+            "未找到 MuseScore（曲谱排版引擎，免费开源）。\n"
+            "请先安装 MuseScore 4：https://musescore.org/zh-hans/download\n"
+            "装好后本软件会自动识别，无需配置；也可用环境变量 SCORE_MUSESCORE 指定路径。")
+    print(f"[pulu] 排版引擎：{ms}")
+
+    tmpdir = tempfile.mkdtemp(prefix="pulu_")
+    try:
+        raw = _pulu_download(levels[key]).decode('utf-8', 'ignore')
+        if '<score-partwise' not in raw and '<score-timewise' not in raw:
+            raise ValueError("下载到的内容不是 MusicXML（酷狗直链有时效，可能已过期，请重试）")
+
+        x, n_osmd = _pulu_strip_osmd(raw)      # 必须在写盘前删：交付件要能被 MuseScore 直接打开
+        x, n_pedal = _pulu_strip_pedal(x)
+        x = _pulu_set_title(x, custom or song)
+        x, n_drop = _pulu_keep_first_part(x)
+        if n_drop == 0:
+            print("[pulu] 提示：该谱只有一个声部，已原样保留（无伴奏可裁）")
+
+        xml_tmp = os.path.join(tmpdir, "score.musicxml")
+        with open(xml_tmp, 'w', encoding='utf-8', newline='') as f:
+            f.write(x)
+
+        stem = f"{song}-{singer}" if singer else song
+        os.makedirs(output_dir, exist_ok=True)
+        out = os.path.join(output_dir, safe_name(f"{stem}-小提琴") + ".pdf")
+        if not mxl2pdf(ms, xml_tmp, out):
+            raise ValueError(
+                "MuseScore 排版失败（未产出 PDF）。\n"
+                "请确认 MuseScore 能正常启动（首次运行需初始化音源，耗时较长），然后重试。")
+
+        # 自检（交付前必过）
+        n_note = len(re.findall(r'<note[ >/]', x))
+        n_lyric = len(re.findall(r'<lyric', x))
+        n_left = len(_PULU_OSMD_ATTR.findall(x))
+        cn = _pdf_cjk_count(out)
+        print(f"[pulu] 自检：删osmdScoreType={n_osmd} 清踏板={n_pedal} 裁声部={n_drop} "
+              f"音符={n_note} 歌词={n_lyric} 残留属性={n_left} PDF汉字={cn}")
+        if n_left:
+            raise ValueError(f"自检未通过：谱面仍含 {n_left} 处 osmdScoreType（MuseScore 打开会崩溃）")
+        if n_lyric == 0:
+            print("[pulu] ⚠ 未提取到歌词（酷狗侧该谱可能本就没有对轴歌词）")
+        if cn == 0:
+            raise ValueError("自检未通过：PDF 中未检出任何中文（中文字体渲染失败）")
+        print(f"✅ PDF 已生成：{out}（{os.path.getsize(out)} 字节 · 酷狗 {level} 小提琴单行版）")
+        return out
+    finally:
+        try:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
 
 
 def extract_generic(html: str):
@@ -740,6 +1682,7 @@ def parse_title_fields(title: str):
 
 # ===================== OCR 自动命名 =====================
 _OCR_ENGINE = None
+_CAPTCHA_OCR = None
 
 
 def _get_ocr_engine():
@@ -767,7 +1710,7 @@ def ocr_first_page_title(images) -> str:
         arr = np.array(img)
         result, _ = engine(arr)
         if not result:
-            return ""
+            return "", ""
         # 置信度过滤（0.5 以下多为噪点）。注意 rapidocr 1.2.x 返回的置信度为字符串，须转 float
         def _conf(r):
             try:
@@ -776,7 +1719,7 @@ def ocr_first_page_title(images) -> str:
                 return 0.0
         lines = [r for r in result if len(r) >= 3 and _conf(r) > 0.5] or list(result)
         if not lines:
-            return ""
+            return "", ""
         # 取最上方 5 行中「行高最大」者——曲谱标题通常字号最大。
         # box 为四点坐标 [[左上],[右上],[右下],[左下]]，左上 y = r[0][0][1]，行高 = 左下 y - 左上 y
         top = sorted(lines, key=lambda r: r[0][0][1])[:5]
@@ -874,10 +1817,31 @@ def _run_multi(input_str: str, output_dir: str, theme: str, custom: str):
     return out
 
 
-def run(input_str: str, output_dir: str, theme: str = "", custom: str = ""):
+def write_meta(pdf_path: str):
+    """写入 PDF /Info 元数据（曲名/歌手/专辑），等价于 MP3 的 ID3，使曲库与播放器可读。
+    曲名/歌手/专辑由 library_ops.smart_split 从文件名解析（编配/乐器描述自动剔除）。"""
+    try:
+        from library_ops import smart_split, write_pdf_metadata
+        base = os.path.splitext(os.path.basename(pdf_path))[0]
+        mt, ma, malb = smart_split(base)
+        if write_pdf_metadata(pdf_path, title=mt or None, artist=ma or None,
+                              album=malb or None):
+            print(f"[元数据] 已写入：曲={mt or '-'} 歌手={ma or '-'} 专辑={malb or '-'}")
+    except Exception as e:
+        print(f"[元数据] 写入跳过：{e}")
+
+
+def run(input_str: str, output_dir: str, theme: str = "", custom: str = "",
+        captcha_ans: str = ""):
+    """处理主入口。captcha_ans：词曲网 WAF 验证码手动答案（前端弹窗输入，可选）。"""
     # 多路径合并模式（队列项多文件按序合一份 PDF），优先于所有其他分支
     if "\u001e" in input_str:
         return _run_multi(input_str, output_dir, theme, custom)
+    # 整段分享文本 → 抽取链接（手机 App 的「分享」会带上中文前缀与后缀）
+    _u = extract_url(input_str)
+    if _u != input_str.strip():
+        print(f"[来源] 已从分享文本中识别出链接：{_u}")
+        input_str = _u
     # 编码免疫：Windows 管道默认 ANSI(GBK)，路径/曲名含 emoji 时 print 会 UnicodeEncodeError → 处理整体失败
     # 强制 stdout/stderr 为 UTF-8（StringIO 场景无 reconfigure，异常忽略即可）
     for _s in (sys.stdout, sys.stderr):
@@ -911,14 +1875,26 @@ def run(input_str: str, output_dir: str, theme: str = "", custom: str = ""):
         if not theme and not custom:
             custom = "曲谱合集"
     elif input_str.lower().startswith("http"):
+        # 酷狗 Pulu：谱面是 MusicXML（结构化），走矢量排版出口，不进位图管线
+        if "kugou.com" in input_str.lower():
+            out = process_pulu(input_str, output_dir, custom=custom)
+            write_meta(out)
+            return out
         ktvc8 = "ktvc8.com" in input_str.lower()
         cookie = os.environ.get("SCORE_KTVC8_COOKIE", "")
+        # 词曲网移动端 SSL 不稳定 + WAF 严，自动切桌面版
+        if ktvc8 and "/mobile/" in input_str:
+            desktop_url = re.sub(r'/mobile/(\d+_\d+\.html)', r'/article/article_\1', input_str)
+            desktop_url = re.sub(r'[?&]mobile=1', '', desktop_url).rstrip('?')
+            print(f"[来源] 词曲网移动端 → 桌面版: {desktop_url}")
+            input_str = desktop_url
         html = fetch_html(input_str, cookie=cookie)
-        # 虫虫钢琴：ccmz 完整曲谱（付费预览图绕过，取公开工程文件渲染）
+        # 虫虫钢琴：ccmz 完整曲谱（付费预览图绕过）→ 与酷狗同规范的单行小提琴版
         if "gangqinpu.com" in input_str.lower() and ".ccmz" in html:
-            print("[来源] 虫虫钢琴（ccmz 完整版）")
-            out = process_ccmz(input_str, output_dir)
+            print("[来源] 虫虫钢琴（ccmz · 单行小提琴版）")
+            out = process_ccmz(input_str, output_dir, custom=custom)
             if out:
+                write_meta(out)
                 return out
             raise ValueError("虫虫 ccmz 渲染失败")
         # 天天钢琴：谱面为矢量 SVG 多页，走专用渲染（Edge headless → PNG → 白底）
@@ -932,19 +1908,72 @@ def run(input_str: str, output_dir: str, theme: str = "", custom: str = ""):
                 custom = piastudy_title(html)  # 页面标题干净名（无自定义时）
         elif ktvc8:
             # 词曲网：位图谱面，支持分页收集
+            images = []
             if is_waf_page(html):
-                # 云锁拦截（含 JS 自动跳转挑战页）→ 自动降级 puppeteer 引擎（真实浏览器执行 JS 过验证）
-                js_imgs, js_title = _ktvc8_fetch_js(input_str, cookie)
-                if not js_imgs:
-                    raise ValueError(
-                        "词曲网被云锁（WAF）拦截，且浏览器引擎兜底未取得图片："
-                        "请用浏览器打开页面，右键复制曲谱图片地址直接粘贴到本输入框重试；"
-                        "或确认软件已更新（内置浏览器引擎）。")
-                print(f"[来源] 词曲网（云锁挑战 → 浏览器引擎兜底，{len(js_imgs)} 张）")
-                images = process_images(js_imgs, is_tan8=False)
-                if not theme and not custom and js_title:
-                    custom = ktvc8_title(f"<title>{js_title}</title>")
-            else:
+                # 云锁拦截 → 优先级：手动答案（重跑）> OCR 自动 > @ask 同会话弹窗
+                #   ① 已有手动答案（前端弹窗后重跑）：单会话取图+提交
+                if captcha_ans and captcha_ans != "@ask":
+                    real_html, waf_cookie = _ktvc8_solve_waf(
+                        input_str, cookie, manual_ans=captcha_ans)
+                    if real_html and not real_html.startswith("__CAPTCHA"):
+                        html = real_html
+                        cookie = waf_cookie if waf_cookie else cookie
+                        print("[来源] 词曲网（云锁验证码已确认）")
+                    else:
+                        raise ValueError(
+                            "KTVC8_CAPTCHA=RETRY\n"
+                            "验证码输入不正确，请重新查看验证码后再试。")
+                #   ② 无手动答案：先 OCR 自动（4 轮），失败走 @ask 同会话弹窗
+                else:
+                    real_html, waf_cookie = _ktvc8_solve_waf(input_str, cookie)
+                    if real_html and real_html.startswith("__CAPTCHA_REQUIRED__:"):
+                        # 自动失败 → @ask 同会话模式：取图打印标记 → 等答案文件 → 提交
+                        cap_path = real_html.split(":", 1)[1]
+                        can_ask = os.environ.get("SCORE_KTVC8_INTERACTIVE", "") == "1"
+                        if can_ask:
+                            real_html, waf_cookie = _ktvc8_solve_waf(
+                                input_str, cookie, manual_ans="@ask")
+                            if not real_html:
+                                raise ValueError(
+                                    f"KTVC8_CAPTCHA={cap_path}\n"
+                                    "词曲网验证码输入超时或已取消。")
+                            html = real_html
+                            cookie = waf_cookie if waf_cookie else cookie
+                            print("[来源] 词曲网（云锁验证码已确认）")
+                        else:
+                            raise ValueError(
+                                f"KTVC8_CAPTCHA={cap_path}\n"
+                                "词曲网被云锁拦截，验证码自动识别失败。"
+                                "请查看弹窗中的验证码图片并输入字符后重试。")
+                    elif real_html:
+                        html = real_html
+                        cookie = waf_cookie if waf_cookie else cookie
+                        print("[来源] 词曲网（云锁验证已通过）")
+                        # WAF 验证成功 → 真实页面是 JS 渲染的，直接用 puppeteer 引擎取图
+                        js_imgs, js_title = _ktvc8_fetch_js(input_str, cookie)
+                        if js_imgs:
+                            images = process_images(js_imgs, is_tan8=False)
+                            if not theme and not custom and js_title:
+                                custom = ktvc8_title(f"<title>{js_title}</title>")
+                        if not images:
+                            print("⚠ 浏览器引擎未提取到图片，继续尝试 HTML 提取")
+                    else:
+                        # OCR + @ask 全失败 → 降级 puppeteer 引擎
+                        js_imgs, js_title = _ktvc8_fetch_js(input_str, cookie)
+                        if not js_imgs:
+                            raise ValueError(
+                                "词曲网被云锁（WAF）拦截，自动验证与浏览器引擎兜底均失败："
+                                "请用浏览器打开页面，右键复制曲谱图片地址直接粘贴到本输入框重试；"
+                                "或确认软件已更新（内置浏览器引擎）。")
+                        print(f"[来源] 词曲网（云锁挑战 → 浏览器引擎兜底，{len(js_imgs)} 张）")
+                        images = process_images(js_imgs, is_tan8=False)
+                        if not theme and not custom and js_title:
+                            custom = ktvc8_title(f"<title>{js_title}</title>")
+                        if images:
+                            pass
+                        else:
+                            return None
+            if not images:
                 print("[来源] 词曲网（位图 · 分页）")
                 pages = ktvc8_page_urls(input_str, html)
                 images = []
@@ -953,7 +1982,6 @@ def run(input_str: str, output_dir: str, theme: str = "", custom: str = ""):
                     if is_waf_page(p_html):
                         break
                     imgs = _ktvc8_imgs(p_html)
-                    # 兜底：JS 注入型页面（剩余页图只在浏览器端生成）→ 按首图编号递增探测
                     if len(imgs) <= 1:
                         imgs = _ktvc8_probe_next(imgs, cookie=cookie)
                         if len(imgs) > 1:
@@ -961,7 +1989,13 @@ def run(input_str: str, output_dir: str, theme: str = "", custom: str = ""):
                     print(f"  页 {p_url.rsplit('/', 1)[-1]}: 候选 {len(imgs)} 张")
                     images.extend(process_images(imgs, is_tan8=False))
                 if not images:
-                    # 常规提取 0 张 → 浏览器引擎兜底一次
+                    # 新结构兜底：谱图由 show_neirong() 动态注入，URL 藏在 showvisitjs.asp
+                    # 返回的 JS 里（需先过 /plcms.asp 滑动验证）。纯 HTTP，优先于浏览器引擎。
+                    sv_imgs = _ktvc8_showvisit_imgs(html, cookie)
+                    if sv_imgs:
+                        print(f"[来源] 词曲网（showvisitjs 通道 → {len(sv_imgs)} 张）")
+                        images = process_images(sv_imgs, is_tan8=False)
+                if not images:
                     js_imgs, js_title = _ktvc8_fetch_js(input_str, cookie)
                     if js_imgs:
                         print(f"[来源] 词曲网（常规提取 0 张 → 浏览器引擎兜底，{len(js_imgs)} 张）")
@@ -1015,15 +2049,7 @@ def run(input_str: str, output_dir: str, theme: str = "", custom: str = ""):
     out = os.path.join(output_dir, name)
     to_pdf(images, out)
     # 自动写入 PDF /Info 元数据（曲名/歌手/专辑），等价于 MP3 的 ID3，使曲库与播放器可读
-    try:
-        from library_ops import smart_split, write_pdf_metadata
-        base = os.path.splitext(name)[0]
-        mt, ma, malb = smart_split(base)
-        if write_pdf_metadata(out, title=mt or None, artist=ma or None,
-                              album=malb or None):
-            print(f"[元数据] 已写入：曲={mt or '-'} 歌手={ma or '-'} 专辑={malb or '-'}")
-    except Exception as e:
-        print(f"[元数据] 写入跳过：{e}")
+    write_meta(out)
     print(f"✅ PDF 已生成：{out}（{len(images)} 页 · {TARGET_WIDTH}px · {PDF_DPI}DPI）")
     return out
 
@@ -1077,6 +2103,7 @@ def main():
     ap.add_argument("--theme", default="", help="追加到文件名的额外标签（可选）")
     ap.add_argument("--name", default="", help="自定义文件名（不含扩展名）")
     ap.add_argument("--cookie", default="", help="网站 Cookie（词曲网 ktvc8 云锁会话，可选）")
+    ap.add_argument("--captcha", default="", help="词曲网 WAF 验证码手动答案（前端弹窗输入，可选）")
     ap.add_argument("--selftest", action="store_true", help="运行冒烟测试")
     args = ap.parse_args()
 
@@ -1087,7 +2114,8 @@ def main():
         return
     if not args.input:
         ap.error("需提供 --input 或 --selftest")
-    out = run(args.input, args.output_dir, theme=args.theme, custom=args.name)
+    out = run(args.input, args.output_dir, theme=args.theme, custom=args.name,
+              captcha_ans=args.captcha)
     if out is None:
         print("未生成 PDF：若提示命名失败，请补充 --name 指定曲名后重试。")
 

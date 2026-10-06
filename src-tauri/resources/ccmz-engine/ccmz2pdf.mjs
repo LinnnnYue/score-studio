@@ -4,6 +4,8 @@ import puppeteer from 'puppeteer-core';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import http from 'node:http';
+import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createServer } from 'node:http';
 
@@ -89,39 +91,74 @@ async function main() {
   await new Promise((r) => server.listen(PORT, r));
   console.log('🚀 服务器: http://localhost:' + PORT);
 
-  // 清理可能残留的 puppeteer 临时 profile（上次崩溃留下的锁会导致下次 launch 失败）
+  // 清理可能残留的 puppeteer 临时 profile（上次崩溃留下的锁会导致下次启动失败）
   try {
     const tmp = os.tmpdir();
     const fs2 = fs.readdirSync(tmp);
     for (const f of fs2) {
-      if (f.startsWith('puppeteer_dev_chrome_profile')) {
+      if (f.startsWith('puppeteer_dev_chrome_profile') || f.startsWith('score_edge_profile')) {
         fs.rmSync(path.join(tmp, f), { recursive: true, force: true });
       }
     }
   } catch (_) {}
 
-  // 启动浏览器（失败自动重试，清残留锁后再试一次）
+  // 启动浏览器：Edge 153+ 采用「启动器 → 宿主」分离架构——msedge.exe 拉起真正的
+  // 浏览器进程后立即退出，puppeteer.launch() 会误判为启动失败（onClose, Code: 0）。
+  // 对策：自行 spawn Edge + 等待 CDP 端口就绪，再用 puppeteer.connect() 接管，
+  // 完全绕开对浏览器进程生存期的依赖。
+  const DBG_PORT = PORT + 1;
+  const PROFILE_DIR = path.join(os.tmpdir(), 'score_edge_profile_' + process.pid);
   let browser = null;
+  let edgeChild = null;
   let lastErr = null;
+
+  const cdpReady = () =>
+    new Promise((resolve) => {
+      const req = http.get(
+        { host: '127.0.0.1', port: DBG_PORT, path: '/json/version', timeout: 1500 },
+        (res) => { res.resume(); resolve(res.statusCode === 200); },
+      );
+      req.on('error', () => resolve(false));
+      req.on('timeout', () => { req.destroy(); resolve(false); });
+    });
+
   for (let attempt = 1; attempt <= 2 && !browser; attempt++) {
     try {
-      browser = await puppeteer.launch({
-        headless: 'new',
-        executablePath: EDGE,
-        args: [
-          '--no-sandbox', '--disable-setuid-sandbox', '--disable-gpu',
-          '--disable-dev-shm-usage', '--allow-file-access-from-files',
-          '--disable-features=msEdgeSidebarV2',
-        ],
+      try { fs.rmSync(PROFILE_DIR, { recursive: true, force: true }); } catch (_) {}
+      edgeChild = spawn(EDGE, [
+        '--headless=new',
+        '--disable-gpu',
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--allow-file-access-from-files',
+        '--disable-features=msEdgeSidebarV2',
+        '--no-first-run',
+        '--no-default-browser-check',
+        '--remote-debugging-port=' + DBG_PORT,
+        '--user-data-dir=' + PROFILE_DIR,
+        'about:blank',
+      ], { stdio: 'ignore', detached: false });
+      edgeChild.on('error', () => {});
+
+      // 轮询 CDP 端点就绪（最多 ~24s）
+      let ready = false;
+      for (let i = 0; i < 48; i++) {
+        if (await cdpReady()) { ready = true; break; }
+        await new Promise((r) => setTimeout(r, 500));
+      }
+      if (!ready) throw new Error(`CDP 端口 ${DBG_PORT} 未就绪`);
+
+      browser = await puppeteer.connect({
+        browserURL: 'http://127.0.0.1:' + DBG_PORT,
+        defaultViewport: null,
       });
     } catch (e) {
       lastErr = e;
-      console.error(`⚠️ Edge 启动失败（第 ${attempt} 次）: ${e.message.slice(0, 120)}`);
-      if (attempt === 1) {
-        // 再清理一次 profile 并稍等重试（Edge 更新/崩溃后常需重启 profile）
-        try { fs.rmSync(path.join(os.tmpdir(), 'puppeteer_dev_chrome_profile'), { recursive: true, force: true }); } catch (_) {}
-        await new Promise((r) => setTimeout(r, 1200));
-      }
+      console.error(`⚠️ Edge 启动失败（第 ${attempt} 次）: ${String(e && e.message).slice(0, 160)}`);
+      try { if (edgeChild) edgeChild.kill(); } catch (_) {}
+      edgeChild = null;
+      if (attempt === 1) await new Promise((r) => setTimeout(r, 1200));
     }
   }
   if (!browser) {
@@ -222,7 +259,12 @@ async function main() {
     await page.screenshot({ path: path.join(__dirname, 'ccmz2pdf_debug.png') });
     process.exitCode = 1;
   }
-  await browser.close();
+  // connect 模式：close() 会断开并请求浏览器退出；再补一刀确保 Edge 宿主进程真的走掉，
+  // 最后清理本次专用 profile（避免 Temp 目录堆积）。
+  try { await browser.close(); } catch (_) {}
+  try { if (edgeChild) edgeChild.kill(); } catch (_) {}
+  await sleep(600);
+  try { fs.rmSync(PROFILE_DIR, { recursive: true, force: true }); } catch (_) {}
 }
 
 main()

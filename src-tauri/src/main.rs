@@ -208,6 +208,20 @@ struct RunErr {
 /// 子进程超时阈值（看门狗）：网络半开 / 畸形输入 / 引擎挂起时，超时即 kill。
 const PROC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// spawn（不吞 stdout/stderr，供上层流式逐行扫描，如验证码弹窗事件推送）。
+fn run_child_stream(cmd: &mut Command, _app: &tauri::AppHandle) -> Result<Child, RunErr> {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
+    cmd.spawn().map_err(|e| {
+        let diag = get_py_diag();
+        let msg = if diag.is_empty() {
+            format!("子进程启动失败（退出码 9009）：{}", e)
+        } else {
+            format!("子进程启动失败（退出码 9009）：{}. {}", diag, e)
+        };
+        RunErr { code: 9009, message: msg }
+    })
+}
+
 /// spawn + 带超时的进程执行（标准库实现，无新增依赖）：
 /// - stdout / stderr 交由独立线程收集，主线程每 50ms 轮询 `try_wait()`；
 /// - 超过 PROC_TIMEOUT 仍未退出 → `child.kill()` 并返回超时错误；
@@ -403,19 +417,28 @@ async fn process_scores(
     theme: String,
     name: String,
     cookie: Option<String>,
+    captcha: Option<String>,
 ) -> ProcessResult {
-    tauri::async_runtime::spawn_blocking(move || {
+    fn process_scores_inner(app: tauri::AppHandle, input: String, output_dir: String,
+                                   theme: String, name: String, cookie: Option<String>,
+                                   captcha: Option<String>) -> ProcessResult {
         let python = resolve_python(&app);
         let script = resolve_pipeline(&app);
 
         let mut cmd = Command::new(&python);
         hide_console(&mut cmd);
-        // 词曲网等需云锁 Cookie 的站点：经环境变量透传（避免命令行长度/转义问题）
         if let Some(ck) = cookie {
             if !ck.trim().is_empty() {
                 cmd.env("SCORE_KTVC8_COOKIE", ck.trim());
             }
         }
+        if let Some(ca) = captcha {
+            if !ca.trim().is_empty() {
+                cmd.arg("--captcha").arg(ca.trim());
+            }
+        }
+        // 前端已支持验证码弹窗（同会话 @ask 模式）：允许 Python 在自动识别失败时挂起等答案文件
+        cmd.env("SCORE_KTVC8_INTERACTIVE", "1");
         if python == "py" {
             cmd.arg("-3");
         }
@@ -431,34 +454,98 @@ async fn process_scores(
             cmd.arg("--name").arg(&name);
         }
 
-        match run_child_timeout(&mut cmd, None) {
-            Ok((status, out, err)) => {
-                let combined = format!("{}{}", out, err);
-                let ok = status.success() && combined.contains("✅");
-                let path = if ok {
-                    combined
-                        .split("✅ PDF 已生成：")
-                        .nth(1)
-                        .and_then(|s| s.lines().next())
-                        .map(|s| s.trim().to_string())
-                } else {
-                    None
+        // spawn 子进程：stdout 逐行扫描，发现验证码标记 → emit 事件给前端 → 前端弹窗
+        let mut child = match run_child_stream(&mut cmd, &app) {
+            Ok(c) => c,
+            Err(e) => {
+                return ProcessResult {
+                    ok: false,
+                    path: None,
+                    log: String::new(),
+                    error: Some(e.message),
                 };
-                ProcessResult {
-                    ok,
-                    path,
-                    log: out,
-                    error: if ok { None } else { Some(combined.trim().to_string()) },
+            }
+        };
+        let so = child.stdout.take().expect("stdout pipe");
+        let se = child.stderr.take().expect("stderr pipe");
+        let out_handle = std::thread::spawn({
+            let app = app.clone();
+            move || {
+                use std::io::{BufRead, BufReader};
+                let mut full = String::new();
+                let reader = BufReader::new(so);
+                for line in reader.lines() {
+                    let Ok(line) = line else { continue };
+                    if line.contains("__KTVC8_CAPTCHA_SHOW__:") {
+                        let path = line.split("__KTVC8_CAPTCHA_SHOW__:").nth(1)
+                            .unwrap_or("").trim().to_string();
+                        use tauri::Emitter;
+                        let _ = app.emit("ktvc8-captcha", path);
+                    }
+                    full.push_str(&line);
+                    full.push('\n');
+                }
+                full
+            }
+        });
+        let err_handle = std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = read_to_end_lossy(se, &mut buf);
+            buf
+        });
+
+        let start = std::time::Instant::now();
+        let ok_status = loop {
+            match child.try_wait() {
+                Ok(Some(st)) => break st.success(),
+                Ok(None) => {
+                    if start.elapsed() >= PROC_TIMEOUT {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        let _ = out_handle.join();
+                        let _ = err_handle.join();
+                        return ProcessResult {
+                            ok: false,
+                            path: None,
+                            log: String::new(),
+                            error: Some("子进程执行超时（120s），已强制终止".to_string()),
+                        };
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(e) => {
+                    let _ = out_handle.join();
+                    let _ = err_handle.join();
+                    return ProcessResult {
+                        ok: false,
+                        path: None,
+                        log: String::new(),
+                        error: Some(e.to_string()),
+                    };
                 }
             }
-            Err(e) => ProcessResult {
-                ok: false,
-                path: None,
-                log: String::new(),
-                error: Some(e.message),
-            },
+        };
+        let out = out_handle.join().unwrap_or_default();
+        let err = err_handle.join().unwrap_or_default();
+        let combined = format!("{}{}", out, err);
+        let path = if ok_status && combined.contains("✅") {
+            combined
+                .split("✅ PDF 已生成：")
+                .nth(1)
+                .and_then(|s| s.lines().next())
+                .map(|s| s.trim().to_string())
+        } else {
+            None
+        };
+        ProcessResult {
+            ok: ok_status && path.is_some(),
+            path,
+            log: out,
+            error: if ok_status && combined.contains("✅") { None } else { Some(combined.trim().to_string()) },
         }
-    })
+    }
+
+    tauri::async_runtime::spawn_blocking(move || process_scores_inner(app, input, output_dir, theme, name, cookie, captcha))
     .await
     .unwrap_or(ProcessResult {
         ok: false,
@@ -466,6 +553,42 @@ async fn process_scores(
         log: String::new(),
         error: Some("后台任务调度失败".to_string()),
     })
+}
+
+/// 写入词曲网验证码答案文件（前端弹窗输入 → @ask 同会话 Python 读取继续）。
+/// 路径固定为系统 TEMP/score_ktvc8_answer.txt——与 Python 侧 tempfile.gettempdir() 对齐
+/// （Windows 上两者都源自 TEMP/TMP 环境变量），避免路径不一致导致的静默失败。
+#[tauri::command]
+fn write_text_file(text: String) -> bool {
+    let tmp = std::env::var("TEMP")
+        .or_else(|_| std::env::var("TMP"))
+        .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().to_string());
+    let path = std::path::Path::new(&tmp).join("score_ktvc8_answer.txt");
+    std::fs::write(&path, text).is_ok()
+}
+
+/// 读取词曲网验证码图片 → base64 data URI（前端弹窗显示，规避 CSP/asset 协议配置）。
+/// 纯 Rust 手写 base64（不引入额外依赖）。
+#[tauri::command]
+fn read_captcha_image(path: String) -> String {
+    const TBL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    fn b64(data: &[u8]) -> String {
+        let mut out = String::new();
+        for chunk in data.chunks(3) {
+            let b = [chunk[0],
+                     chunk.get(1).copied().unwrap_or(0),
+                     chunk.get(2).copied().unwrap_or(0)];
+            out.push(TBL[(b[0] >> 2) as usize] as char);
+            out.push(TBL[(((b[0] & 0x03) << 4) | (b[1] >> 4)) as usize] as char);
+            out.push(if chunk.len() > 1 { TBL[(((b[1] & 0x0F) << 2) | (b[2] >> 6)) as usize] as char } else { '=' });
+            out.push(if chunk.len() > 2 { TBL[(b[2] & 0x3F) as usize] as char } else { '=' });
+        }
+        out
+    }
+    match std::fs::read(&path) {
+        Ok(bytes) => format!("data:image/png;base64,{}", b64(&bytes)),
+        Err(e) => format!("__ERR__:{}", e),
+    }
 }
 
 /// 列出输出目录中的 PDF（曲库视图）。
@@ -642,6 +765,8 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             process_scores,
+            read_captcha_image,
+            write_text_file,
             list_library,
             open_path,
             get_library,

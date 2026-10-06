@@ -66,6 +66,11 @@ def main():
         "本目录已自带完整 Python 运行时（python_dist/），不依赖系统安装 Python。\n"
         "本目录已自带 ccmz 渲染引擎（ccmz-engine/，含 Node.js），虫虫钢琴完整曲谱开箱即用。\n"
         "\n"
+        "【推荐安装】MuseScore 4（免费开源，曲谱排版引擎）\n"
+        "  下载：https://musescore.org/zh-hans/download\n"
+        "  用途：酷狗曲谱 / 虫虫钢琴 → 输出「单行小提琴版」矢量 PDF（可缩放不失真、体积小）。\n"
+        "  装好后软件自动识别，无需任何配置；未安装时虫虫源会自动降级为完整双谱表版。\n"
+        "\n"
         "目录结构：\n"
         "  score-studio.exe     主程序\n"
         "  python_dist/         内嵌 Python 3.13 + Pillow/numpy/PyMuPDF\n"
@@ -76,6 +81,7 @@ def main():
         "如需手动指定 Python 或脚本路径，可设置环境变量：\n"
         "  SCORE_PYTHON     指向任意 python 解释器\n"
         "  SCORE_PIPELINE   指向自定义 sheet_pipeline.py\n"
+        "  SCORE_MUSESCORE  指向 MuseScore 可执行文件（自动识别失败时用）\n"
     )
 
     print("[1/5] 流式打包 score-studio.exe ...")

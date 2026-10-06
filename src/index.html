@@ -50,7 +50,7 @@
 
         <div class="field-label">SOURCE · 来源链接</div>
         <div class="input-row">
-          <input class="input" id="linkInput" placeholder="https://mp.weixin.qq.com/s/...  或  tan8.com / 抖音图文 ..." />
+          <input class="input" id="linkInput" placeholder="粘贴链接，或直接粘贴 App 分享的整段文字（曲谱会自动识别其中链接）" />
           <button class="btn-gold" id="addBtn">收入队列</button>
         </div>
 
@@ -164,6 +164,27 @@
                      placeholder="security_session_verify=...; Hm_lvt_...=...; a=..." autocomplete="off" spellcheck="false" />
               <button class="btn-ghost" id="cookieToggle" title="显示/隐藏">👁</button>
             </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 词曲网云锁验证码弹窗：自动识别失败时弹出，用户手输（100% 可靠） -->
+      <div class="setup-overlay hidden" id="captchaOverlay">
+        <div class="setup-card" style="max-width:420px;">
+          <div class="setup-title">词曲网 · 云锁验证</div>
+          <div class="setup-sub">验证码自动识别未通过，请肉眼识别下方图片并输入字符（点击图片可放大查看）。</div>
+          <div style="text-align:center;margin:14px 0;background:var(--bg2,#1b2230);border-radius:10px;padding:14px;">
+            <img id="captchaImg" alt="验证码" style="max-width:100%;height:auto;image-rendering:pixelated;cursor:zoom-in;
+                 border-radius:6px;border:1px solid var(--line,#2c3648);" />
+          </div>
+          <div class="dir-row">
+            <input id="captchaInput" class="cookie-input" autocomplete="off" spellcheck="false"
+                   placeholder="输入验证码字符（如：8a3k2）" />
+          </div>
+          <div id="captchaHint" style="margin-top:8px;font-size:11px;color:#e05f5f;min-height:14px;text-align:center;"></div>
+          <div style="margin-top:18px; display:flex; gap:10px; justify-content:center;">
+            <button class="btn-gold" id="captchaConfirm">确认并继续</button>
+            <button class="btn-ghost" id="captchaCancel">放弃此项</button>
           </div>
         </div>
       </div>

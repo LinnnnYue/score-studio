@@ -66,7 +66,9 @@ def main():
     # 4. install deps
     print("== pip install deps ==")
     run([py, "-m", "pip", "install", "--no-cache-dir", "--no-warn-script-location",
-         "Pillow", "numpy", "PyMuPDF"], cwd=DIST)
+         "Pillow", "numpy", "PyMuPDF",
+         "rapidocr_onnxruntime",
+         "ddddocr"], cwd=DIST)
 
     # 6. copy pipeline script
     print("== copy pipeline ==")
@@ -74,7 +76,7 @@ def main():
 
     # 7. test
     print("== test imports ==")
-    r = subprocess.run([py, "-c", "import PIL, numpy, fitz; print('IMPORTS_OK', PIL.__version__, numpy.__version__, fitz.__doc__[:40])"],
+    r = subprocess.run([py, "-c", "import PIL, numpy, fitz; import ddddocr; print('IMPORTS_OK', PIL.__version__, numpy.__version__, fitz.__doc__[:40])"],
                        capture_output=True, text=True)
     print(r.stdout, r.stderr)
 
