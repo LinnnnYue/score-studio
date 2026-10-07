@@ -165,6 +165,13 @@
               <button class="btn-ghost" id="cookieToggle" title="显示/隐藏">👁</button>
             </div>
           </div>
+          <div class="set" style="grid-column: 1 / -1;">
+            <h4>运行环境
+              <span style="font-weight:400;font-size:11px;color:var(--muted);">（缺什么这里会说，能修的帮你直接修好）</span>
+              <button class="btn-ghost" id="envRecheck" style="float:right;font-size:11px;padding:3px 10px;">重新检测</button>
+            </h4>
+            <div id="envList" class="env-list"><div class="env-empty">正在检测…</div></div>
+          </div>
         </div>
       </div>
 
@@ -185,6 +192,20 @@
           <div style="margin-top:18px; display:flex; gap:10px; justify-content:center;">
             <button class="btn-gold" id="captchaConfirm">确认并继续</button>
             <button class="btn-ghost" id="captchaCancel">放弃此项</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 首次启动环境引导：缺什么讲清楚，能修的当场修好 -->
+      <div class="setup-overlay hidden" id="envOverlay">
+        <div class="setup-card" style="max-width:540px;">
+          <div class="setup-title">环境自检</div>
+          <div class="setup-sub" id="envGuideSub">正在检查运行环境…</div>
+          <div id="envGuideList" class="env-list"></div>
+          <div class="env-hint" id="envGuideHint"></div>
+          <div style="margin-top:18px; display:flex; gap:10px; justify-content:center;">
+            <button class="btn-gold" id="envFixAll">一键修复</button>
+            <button class="btn-ghost" id="envLater">稍后处理</button>
           </div>
         </div>
       </div>

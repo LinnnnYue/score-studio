@@ -1418,3 +1418,106 @@ $('applyBtn').addEventListener('click', async () => {
     statText.textContent = '重命名失败：' + e;
   }
 });
+
+// ===================== 运行环境体检（环境医生：自检 + 自助修复） =====================
+// 设计意图：小白一条龙 —— 缺什么软件自己查出来，能补的当场补好
+// （如插件装错位置就搬正），补不了的给下载入口，绝不让用户面对术语。
+
+function envRowHtml(it) {
+  const cls = it.status === 'ok' ? 'ok' : (it.status === 'warn' ? 'warn' : 'bad');
+  let act = '';
+  if (it.fixable) {
+    act = `<button class="btn-ghost" data-envfix="${esc(it.id)}">${esc(it.fixLabel || '修复')}</button>`;
+  } else if (it.url) {
+    act = `<button class="btn-ghost" data-envurl="${esc(it.url)}">去下载</button>`;
+  }
+  return `<div class="env-row">
+      <span class="env-dot ${cls}"></span>
+      <span class="env-name">${esc(it.name)}</span>
+      <span class="env-note" title="${esc(it.detail)}">${esc(it.detail)}</span>
+      <span class="env-act">${act}</span>
+    </div>`;
+}
+
+let envData = null;
+
+async function envCheck(showGuide) {
+  const list = $('envList');
+  if (!IS_TAURI) {
+    if (list) list.innerHTML = '<div class="env-empty">浏览器预览模式不做环境检测</div>';
+    return null;
+  }
+  const { invoke } = await import('@tauri-apps/api/core');
+  try {
+    envData = JSON.parse((await invoke('env_doctor')) || '{}');
+  } catch (e) {
+    envData = { ok: false, need: 0, items: [], error: String(e) };
+  }
+  const items = envData.items || [];
+  if (list) {
+    list.innerHTML = items.length ? items.map(envRowHtml).join('')
+      : `<div class="env-empty">检测未返回数据${envData.error ? '：' + esc(envData.error) : ''}</div>`;
+  }
+  if (showGuide) renderEnvGuide();
+  return envData;
+}
+
+function renderEnvGuide() {
+  const need = (envData.items || []).filter((i) => i.status !== 'ok');
+  $('envGuideSub').textContent = need.length
+    ? `发现 ${need.length} 项需要处理。能自动修的当场修好；需要手动安装的，给你下载入口。`
+    : '一切正常，无需处理。';
+  $('envGuideList').innerHTML = need.length ? need.map(envRowHtml).join('')
+    : '<div class="env-empty">全部就绪 ✓</div>';
+  const fixable = need.filter((i) => i.fixable).length;
+  $('envGuideHint').textContent = (need.length && !fixable)
+    ? '提示：带「去下载」的项需要安装对应软件，装好后回到「设置 → 运行环境」点「重新检测」即可。'
+    : '';
+  $('envFixAll').style.display = fixable ? '' : 'none';
+  $('envOverlay').classList.remove('hidden');
+}
+
+async function envDoFix(itemId) {
+  const { invoke } = await import('@tauri-apps/api/core');
+  statText.textContent = '正在修复…';
+  try {
+    const r = JSON.parse((await invoke('env_fix', { itemId })) || '{}');
+    statText.textContent = r.message || (r.ok ? '已修复' : '修复失败');
+  } catch (e) {
+    statText.textContent = '修复失败：' + e;
+  }
+  await envCheck(false);
+}
+
+if ($('envRecheck')) {
+  $('envRecheck').onclick = async () => {
+    statText.textContent = '正在检测环境…';
+    const d = await envCheck(false);
+    if (d) statText.textContent = d.ok ? '环境检测：全部就绪' : `环境检测：${d.need} 项待处理`;
+  };
+}
+if ($('envLater')) $('envLater').onclick = () => $('envOverlay').classList.add('hidden');
+if ($('envFixAll')) {
+  $('envFixAll').onclick = async () => {
+    const fixable = (envData?.items || []).filter((i) => i.status !== 'ok' && i.fixable);
+    for (const it of fixable) await envDoFix(it.id);
+    $('envOverlay').classList.add('hidden');
+  };
+}
+
+document.addEventListener('click', async (ev) => {
+  const fx = ev.target.closest('[data-envfix]');
+  if (fx) { await envDoFix(fx.dataset.envfix); return; }
+  const ur = ev.target.closest('[data-envurl]');
+  if (ur && IS_TAURI) {
+    const { invoke } = await import('@tauri-apps/api/core');
+    const ok = await invoke('open_url', { url: ur.dataset.envurl });
+    if (!ok) statText.textContent = '无法直接打开，请手动访问 musescore.org';
+  }
+});
+
+// 首次启动静默自检：有问题才弹引导（结果记在本地，之后不再打扰）
+if (IS_TAURI && !localStorage.getItem('ss_env_checked')) {
+  localStorage.setItem('ss_env_checked', '1');
+  setTimeout(() => { envCheck(true).catch(() => {}); }, 1500);
+}

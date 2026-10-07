@@ -2916,6 +2916,197 @@ def selftest():
 
 
 # ===================== CLI =====================
+# ===================== 运行环境医生（自检 + 自助修复） =====================
+# 设计目标：小白一条龙 —— 用户缺什么，软件自己查出来并尽量补好；
+# 补不了的说清楚缺什么、去哪装，绝不让用户面对一堆术语。
+ENV_MS_DOWNLOAD = "https://musescore.org/zh-hans/download"
+ENV_EDGE_DOWNLOAD = "https://www.microsoft.com/edge/download"
+
+
+def _env_registry_musescore() -> list:
+    """从注册表卸载项里找 MuseScore 安装位置（比只扫常见路径查得全）。"""
+    out = []
+    try:
+        import winreg
+    except ImportError:
+        return out
+    views = [(winreg.HKEY_LOCAL_MACHINE, r'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'),
+             (winreg.HKEY_LOCAL_MACHINE, r'SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'),
+             (winreg.HKEY_CURRENT_USER, r'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall')]
+    for root, sub in views:
+        try:
+            key = winreg.OpenKey(root, sub)
+        except OSError:
+            continue
+        try:
+            n = winreg.QueryInfoKey(key)[0]
+        except OSError:
+            continue
+        for i in range(n):
+            try:
+                sk = winreg.OpenKey(key, winreg.EnumKey(key, i))
+            except OSError:
+                continue
+            try:
+                disp = str(winreg.QueryValueEx(sk, 'DisplayName')[0])
+            except OSError:
+                continue
+            if 'musescore' not in disp.lower():
+                continue
+            for field in ('InstallLocation', 'DisplayIcon'):
+                try:
+                    v = str(winreg.QueryValueEx(sk, field)[0]).strip('"')
+                except OSError:
+                    continue
+                if not v:
+                    continue
+                d = v if os.path.isdir(v) else os.path.dirname(v)
+                # DisplayIcon 常指向 exe 本身，再往上一层也收进来
+                for cand in (d, os.path.dirname(d)):
+                    if cand and cand not in out:
+                        out.append(cand)
+            try:
+                sk.Close()
+            except Exception:
+                pass
+    return out
+
+
+def _env_qt_platform_dirs(ms: str) -> list:
+    base = os.path.dirname(_clean_win_path(ms))
+    return [os.path.join(base, 'platforms'),
+            os.path.join(base, 'plugins', 'platforms'),
+            os.path.join(os.path.dirname(base), 'plugins', 'platforms')]
+
+
+def _env_find_offscreen_in_tree(ms: str) -> str:
+    """在 MuseScore 安装树内搜 qoffscreen.dll（部分安装放错位置，可搬正）。"""
+    root = os.path.dirname(os.path.dirname(_clean_win_path(ms)))   # .../MuseScore 4
+    if not os.path.isdir(root):
+        return ""
+    for base, dirs, files in os.walk(root):
+        if base.count(os.sep) - root.count(os.sep) > 3:
+            dirs[:] = []
+            continue
+        for f in files:
+            if f.lower() == 'qoffscreen.dll':
+                return os.path.join(base, f)
+    return ""
+
+
+def _env_item(iid, name, status, detail, fixable=False, fix_label="", action="", url=""):
+    return {'id': iid, 'name': name, 'status': status, 'detail': detail,
+            'fixable': fixable, 'fixLabel': fix_label, 'action': action, 'url': url}
+
+
+def env_doctor() -> dict:
+    """体检当前运行环境 → {ok, need, items:[...]}。
+
+    status: ok（可用） / warn（可降级使用，建议修） / bad（功能不可用）
+    action: fix（可自动修，调 env_fix） / open_url（引导下载） / none
+    """
+    items = []
+
+    # ① Python 运行时（自己就在跑，必然可用；报告来源便于排障）
+    here = os.path.dirname(os.path.abspath(__file__))
+    embedded = ('python_dist' in here.lower()) or ('python313' in sys.executable.lower())
+    items.append(_env_item(
+        'python', '曲谱处理运行时', 'ok',
+        f'{"内置运行时" if embedded else "系统 Python"} · {os.path.basename(sys.executable)}'))
+
+    # ② MuseScore（矢量排版引擎）
+    ms = find_musescore()
+    if ms:
+        items.append(_env_item('musescore', 'MuseScore 4', 'ok',
+                               os.path.dirname(os.path.dirname(ms))))
+    else:
+        items.append(_env_item(
+            'musescore', 'MuseScore 4', 'bad',
+            '未安装 —— 矢量谱排版（酷狗 / 虫虫）需要它', action='open_url',
+            url=ENV_MS_DOWNLOAD))
+
+    # ③ MuseScore 的屏幕外渲染插件
+    if ms:
+        dirs = _env_qt_platform_dirs(ms)
+        has_off = any(os.path.isdir(d) and any('offscreen' in f.lower()
+                                               for f in os.listdir(d)) for d in dirs)
+        if has_off:
+            items.append(_env_item('qt_offscreen', 'MuseScore 屏幕外渲染', 'ok',
+                                   '已具备，排版时不会闪窗'))
+        else:
+            found = _env_find_offscreen_in_tree(ms)
+            if found:
+                items.append(_env_item(
+                    'qt_offscreen', 'MuseScore 屏幕外渲染', 'warn',
+                    '插件位置不正确，可一键修正', fixable=True,
+                    fix_label='一键修正', action='fix'))
+            else:
+                items.append(_env_item(
+                    'qt_offscreen', 'MuseScore 屏幕外渲染', 'warn',
+                    '您的 MuseScore 安装未附带该插件 —— 软件会自动改用窗口模式，'
+                    '不影响出谱（排版时可能闪一下窗口）', action='open_url',
+                    url=ENV_MS_DOWNLOAD))
+    else:
+        items.append(_env_item('qt_offscreen', 'MuseScore 屏幕外渲染', 'bad',
+                               '需先安装 MuseScore'))
+
+    # ④ Microsoft Edge（弹唱谱页面反解需要）
+    edge = _pulu_find_edge()
+    if edge:
+        items.append(_env_item('edge', 'Microsoft Edge', 'ok', edge))
+    else:
+        items.append(_env_item('edge', 'Microsoft Edge', 'bad',
+                               '未找到 —— 酷狗「弹唱谱」自动转谱需要它', action='open_url',
+                               url=ENV_EDGE_DOWNLOAD))
+
+    # ⑤ 虫虫钢琴渲染引擎（随安装包分发）
+    eng = _find_ccmz_engine()
+    if eng:
+        items.append(_env_item('ccmz_engine', '虫虫钢琴引擎', 'ok', os.path.dirname(eng)))
+    else:
+        items.append(_env_item('ccmz_engine', '虫虫钢琴引擎', 'bad',
+                               '软件资源缺失，虫虫钢琴链接不可用',
+                               fixable=True, fix_label='重新检测', action='none'))
+
+    need = [i for i in items if i['status'] != 'ok']
+    return {'ok': not need, 'need': len(need), 'items': items,
+            'musescore': ms, 'edge': edge}
+
+
+def env_fix(item_id: str) -> dict:
+    """执行一项自动修复 → {ok, message}。"""
+    if item_id == 'qt_offscreen':
+        ms = find_musescore()
+        if not ms:
+            return {'ok': False, 'message': '未找到 MuseScore，无法修正。'}
+        found = _env_find_offscreen_in_tree(ms)
+        if not found:
+            return {'ok': False, 'message': '您的 MuseScore 里确实没有这个插件，'
+                                            '建议从官网重新安装一次；不修也不影响出谱。'}
+        target_dir = os.path.join(os.path.dirname(_clean_win_path(ms)), 'platforms')
+        try:
+            os.makedirs(target_dir, exist_ok=True)
+            import shutil as _shu
+            _shu.copy2(_clean_win_path(found),
+                       os.path.join(target_dir, 'qoffscreen.dll'))
+            return {'ok': True, 'message': f'已修正：{os.path.basename(found)} → {target_dir}'}
+        except PermissionError:
+            return {'ok': False, 'message': '没有写入权限（MuseScore 装在系统盘）。'
+                                            '请右键软件图标「以管理员身份运行」后重试，'
+                                            '或忽略此项（不影响出谱）。'}
+        except Exception as e:
+            return {'ok': False, 'message': f'修正失败：{e}'}
+    if item_id == 'ccmz_engine':
+        eng = _find_ccmz_engine()
+        return {'ok': bool(eng),
+                'message': '引擎已就位。' if eng else '仍未找到引擎，请重新安装本软件。'}
+    if item_id == 'musescore':
+        return {'ok': False, 'message': 'MuseScore 需手动安装：已为您打开官方下载页。'}
+    if item_id == 'edge':
+        return {'ok': False, 'message': 'Edge 需手动安装：已为您打开官方下载页。'}
+    return {'ok': False, 'message': f'未知的修复项：{item_id}'}
+
+
 def main():
     ap = argparse.ArgumentParser(description="Score Studio 曲谱处理管道")
     ap.add_argument("--input", help="链接 / 本地图片文件夹 / 本地 PDF")
@@ -2925,10 +3116,19 @@ def main():
     ap.add_argument("--cookie", default="", help="网站 Cookie（词曲网 ktvc8 云锁会话，可选）")
     ap.add_argument("--captcha", default="", help="词曲网 WAF 验证码手动答案（前端弹窗输入，可选）")
     ap.add_argument("--selftest", action="store_true", help="运行冒烟测试")
+    ap.add_argument("--env-doctor", action="store_true",
+                    help="环境体检：输出 JSON（供前端引导面板使用）")
+    ap.add_argument("--env-fix", default="", help="执行一项环境修复（配合 --env-doctor）")
     args = ap.parse_args()
 
     if args.cookie:
         os.environ["SCORE_KTVC8_COOKIE"] = args.cookie
+    if args.env_doctor:
+        print(json.dumps(env_doctor(), ensure_ascii=False))
+        return
+    if args.env_fix:
+        print(json.dumps(env_fix(args.env_fix), ensure_ascii=False))
+        return
     if args.selftest:
         selftest()
         return

@@ -738,6 +738,60 @@ async fn album_tag_batch(app: tauri::AppHandle, items: String) -> String {
 }
 
 
+/// 环境体检：调 Python 侧 env_doctor，返回 JSON 供前端渲染引导面板。
+#[tauri::command]
+async fn env_doctor(app: tauri::AppHandle) -> String {
+    tauri::async_runtime::spawn_blocking(move || {
+        let script = resolve_pipeline(&app);
+        let out = run_python_json(&app, &script, &["--env-doctor"]);
+        let last = out.lines().last().unwrap_or("").trim().to_string();
+        if last.starts_with('{') {
+            last
+        } else {
+            format!("{{\"ok\":false,\"need\":0,\"items\":[],\"error\":\"{}\"}}",
+                    last.replace('"', "'").chars().take(200).collect::<String>())
+        }
+    })
+    .await
+    .unwrap_or_else(|_| "{\"ok\":false,\"need\":0,\"items\":[]}".into())
+}
+
+/// 执行一项环境自助修复（修正插件位置 / 复检引擎）。返回 {ok, message}。
+#[tauri::command]
+async fn env_fix(app: tauri::AppHandle, item_id: String) -> String {
+    tauri::async_runtime::spawn_blocking(move || {
+        let script = resolve_pipeline(&app);
+        let out = run_python_json(&app, &script, &["--env-fix", &item_id]);
+        let last = out.lines().last().unwrap_or("").trim().to_string();
+        if last.starts_with('{') {
+            last
+        } else {
+            format!("{{\"ok\":false,\"message\":\"{}\"}}",
+                    last.replace('"', "'").chars().take(200).collect::<String>())
+        }
+    })
+    .await
+    .unwrap_or_else(|_| "{\"ok\":false,\"message\":\"调度失败\"}".into())
+}
+
+/// 用系统默认浏览器打开下载页。**白名单域名**，避免被利用做任意跳转。
+#[tauri::command]
+fn open_url(url: String) -> bool {
+    const ALLOW: [&str; 3] = [
+        "https://musescore.org/",
+        "https://www.microsoft.com/",
+        "https://microsoft.com/",
+    ];
+    if !ALLOW.iter().any(|p| url.starts_with(p)) {
+        return false;
+    }
+    let mut cmd = Command::new("cmd");
+    hide_console(&mut cmd);
+    cmd.args(["/C", "start", "", &url]);
+    cmd.spawn().map(|_| true).unwrap_or(false)
+}
+
+
 /// Windows：将无边框窗口裁剪为圆角矩形，绕过 WebView2 透明兼容性问题。
 #[cfg(target_os = "windows")]
 fn apply_rounded_corners<R: tauri::Runtime>(window: &tauri::WebviewWindow<R>) {
@@ -775,7 +829,10 @@ fn main() {
             inspect_library,
             rename_items,
             album_tag,
-            album_tag_batch
+            album_tag_batch,
+            env_doctor,
+            env_fix,
+            open_url
         ])
         .setup(|app| {
             // Windows：用 SetWindowRgn 把窗体裁剪为圆角，配合 CSS 半径对齐。
