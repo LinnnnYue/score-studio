@@ -1428,8 +1428,11 @@ function envRowHtml(it) {
   let act = '';
   if (it.fixable) {
     act = `<button class="btn-ghost" data-envfix="${esc(it.id)}">${esc(it.fixLabel || '修复')}</button>`;
+  } else if (it.installable) {
+    // 主通道：软件自己下载并装好，用户只需在系统提示里点一次「是」
+    act = `<button class="btn-gold" style="font-size:11px;padding:5px 12px;" data-envinstall="${esc(it.id)}">${esc(it.fixLabel || '帮我装好')}</button>`;
   } else if (it.url) {
-    act = `<button class="btn-ghost" data-envurl="${esc(it.url)}">去下载</button>`;
+    act = `<button class="btn-ghost" data-envurl="${esc(it.url)}">手动下载</button>`;
   }
   return `<div class="env-row">
       <span class="env-dot ${cls}"></span>
@@ -1437,6 +1440,50 @@ function envRowHtml(it) {
       <span class="env-note" title="${esc(it.detail)}">${esc(it.detail)}</span>
       <span class="env-act">${act}</span>
     </div>`;
+}
+
+// 自动安装期间轮询进度：下载 100+MB 必须让用户看到动静
+let envTimer = null;
+function envStopPoll() {
+  if (envTimer) { clearInterval(envTimer); envTimer = null; }
+}
+function envStartPoll() {
+  envStopPoll();
+  envTimer = setInterval(async () => {
+    try {
+      const { invoke } = await import('@tauri-apps/api/core');
+      const p = JSON.parse((await invoke('env_progress')) || '{}');
+      if (!p || !p.msg) return;
+      const pct = (p.stage === 'download' && typeof p.pct === 'number') ? ` ${p.pct}%` : '';
+      const line = p.msg + pct;
+      statText.textContent = line;
+      const h = $('envGuideHint');
+      if (h && !$('envOverlay').classList.contains('hidden')) h.textContent = line;
+    } catch (e) { /* 轮询失败忽略 */ }
+  }, 1000);
+}
+
+async function envAutoInstall(itemId) {
+  const { invoke } = await import('@tauri-apps/api/core');
+  const sub = $('envGuideSub');
+  if (sub && !$('envOverlay').classList.contains('hidden')) {
+    sub.textContent = '正在自动安装，请稍候……（中途若出现系统提示，请点「是」）';
+  }
+  statText.textContent = '正在准备…';
+  envStartPoll();
+  try {
+    const r = JSON.parse((await invoke('env_autoinstall', { itemId })) || '{}');
+    statText.textContent = r.message || (r.ok ? '已完成' : '未成功');
+    if (sub && !$('envOverlay').classList.contains('hidden')) sub.textContent = r.message || '';
+  } catch (e) {
+    statText.textContent = '安装失败：' + e;
+  }
+  envStopPoll();
+  await envCheck(false);
+  if (envData && envData.ok) {
+    // 装好了：引导层收工，给个明确的正反馈
+    setTimeout(() => $('envOverlay').classList.add('hidden'), 900);
+  }
 }
 
 let envData = null;
@@ -1469,11 +1516,11 @@ function renderEnvGuide() {
     : '一切正常，无需处理。';
   $('envGuideList').innerHTML = need.length ? need.map(envRowHtml).join('')
     : '<div class="env-empty">全部就绪 ✓</div>';
-  const fixable = need.filter((i) => i.fixable).length;
-  $('envGuideHint').textContent = (need.length && !fixable)
-    ? '提示：带「去下载」的项需要安装对应软件，装好后回到「设置 → 运行环境」点「重新检测」即可。'
-    : '';
-  $('envFixAll').style.display = fixable ? '' : 'none';
+  const n = need.filter((i) => i.fixable || i.installable).length;
+  $('envGuideHint').textContent = (need.length && !n)
+    ? '这些项需要手动处理，详见「设置 → 运行环境」。'
+    : '点一次即可，其余交给软件完成（中途若出现系统提示，请点「是」）。';
+  $('envFixAll').style.display = n ? '' : 'none';
   $('envOverlay').classList.remove('hidden');
 }
 
@@ -1499,8 +1546,13 @@ if ($('envRecheck')) {
 if ($('envLater')) $('envLater').onclick = () => $('envOverlay').classList.add('hidden');
 if ($('envFixAll')) {
   $('envFixAll').onclick = async () => {
-    const fixable = (envData?.items || []).filter((i) => i.status !== 'ok' && i.fixable);
-    for (const it of fixable) await envDoFix(it.id);
+    const todo = (envData?.items || []).filter((i) => i.status !== 'ok');
+    for (const it of todo) {
+      if (it.fixable) await envDoFix(it.id);
+      else if (it.installable) await envAutoInstall(it.id);
+    }
+    envStopPoll();
+    await envCheck(false);
     $('envOverlay').classList.add('hidden');
   };
 }
@@ -1508,6 +1560,8 @@ if ($('envFixAll')) {
 document.addEventListener('click', async (ev) => {
   const fx = ev.target.closest('[data-envfix]');
   if (fx) { await envDoFix(fx.dataset.envfix); return; }
+  const ins = ev.target.closest('[data-envinstall]');
+  if (ins) { await envAutoInstall(ins.dataset.envinstall); return; }
   const ur = ev.target.closest('[data-envurl]');
   if (ur && IS_TAURI) {
     const { invoke } = await import('@tauri-apps/api/core');

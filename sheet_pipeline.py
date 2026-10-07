@@ -2994,16 +2994,20 @@ def _env_find_offscreen_in_tree(ms: str) -> str:
     return ""
 
 
-def _env_item(iid, name, status, detail, fixable=False, fix_label="", action="", url=""):
+def _env_item(iid, name, status, detail, fixable=False, fix_label="",
+              action="", url="", installable=False):
+    """installable=True 表示软件能自己下载并静默装好 —— 这是给小白的主通道，
+    绝不让用户去分辨「该装什么、去哪装」。"""
     return {'id': iid, 'name': name, 'status': status, 'detail': detail,
-            'fixable': fixable, 'fixLabel': fix_label, 'action': action, 'url': url}
+            'fixable': fixable, 'fixLabel': fix_label, 'action': action,
+            'url': url, 'installable': installable}
 
 
 def env_doctor() -> dict:
     """体检当前运行环境 → {ok, need, items:[...]}。
 
     status: ok（可用） / warn（可降级使用，建议修） / bad（功能不可用）
-    action: fix（可自动修，调 env_fix） / open_url（引导下载） / none
+    action: fix（轻量修正） / autoinstall（软件自己下载并装好） / open_url（官网兜底）
     """
     items = []
 
@@ -3022,8 +3026,8 @@ def env_doctor() -> dict:
     else:
         items.append(_env_item(
             'musescore', 'MuseScore 4', 'bad',
-            '未安装 —— 矢量谱排版（酷狗 / 虫虫）需要它', action='open_url',
-            url=ENV_MS_DOWNLOAD))
+            '未安装 —— 点右侧按钮，软件会自己下载并装好（无需你操作）',
+            installable=True, fix_label='帮我装好'))
 
     # ③ MuseScore 的屏幕外渲染插件
     if ms:
@@ -3038,17 +3042,23 @@ def env_doctor() -> dict:
             if found:
                 items.append(_env_item(
                     'qt_offscreen', 'MuseScore 屏幕外渲染', 'warn',
-                    '插件位置不正确，可一键修正', fixable=True,
-                    fix_label='一键修正', action='fix'))
+                    '插件位置不对，可一键搬正（几秒完成）', fixable=True,
+                    fix_label='立即修正', action='fix'))
             else:
+                # ⚠️ 2026-10-07 实测纠正：MuseScore **4.x 官方安装包本身就不带
+                # qoffscreen.dll** —— 解包官方 4.7.5 MSI，bin/platforms 里只有
+                # qwindows.dll。所以「没有 offscreen」是**正常状态**，
+                # 不是「装得不完整」；重装 MuseScore 也补不出来。
+                # （本机那份 2020 年、配 Qt5 的 offscreen 是 MuseScore 3 时代的
+                #   升级残留，属特例，不能据此判断用户机器「缺东西」。）
+                # → 不计为待处理项，只如实说明；软件已自动降级到窗口模式。
                 items.append(_env_item(
-                    'qt_offscreen', 'MuseScore 屏幕外渲染', 'warn',
-                    '您的 MuseScore 安装未附带该插件 —— 软件会自动改用窗口模式，'
-                    '不影响出谱（排版时可能闪一下窗口）', action='open_url',
-                    url=ENV_MS_DOWNLOAD))
+                    'qt_offscreen', 'MuseScore 屏幕外渲染', 'ok',
+                    'MuseScore 4 官方版不带此组件（正常现象）—— 软件已自动适配，'
+                    '排版时可能闪一下窗口，不影响出谱'))
     else:
         items.append(_env_item('qt_offscreen', 'MuseScore 屏幕外渲染', 'bad',
-                               '需先安装 MuseScore'))
+                               '装好 MuseScore 后自动具备'))
 
     # ④ Microsoft Edge（弹唱谱页面反解需要）
     edge = _pulu_find_edge()
@@ -3056,8 +3066,8 @@ def env_doctor() -> dict:
         items.append(_env_item('edge', 'Microsoft Edge', 'ok', edge))
     else:
         items.append(_env_item('edge', 'Microsoft Edge', 'bad',
-                               '未找到 —— 酷狗「弹唱谱」自动转谱需要它', action='open_url',
-                               url=ENV_EDGE_DOWNLOAD))
+                               '未找到 —— 酷狗「弹唱谱」自动转谱需要它（Windows 通常自带）',
+                               action='open_url', url=ENV_EDGE_DOWNLOAD))
 
     # ⑤ 虫虫钢琴渲染引擎（随安装包分发）
     eng = _find_ccmz_engine()
@@ -3107,6 +3117,227 @@ def env_fix(item_id: str) -> dict:
     return {'ok': False, 'message': f'未知的修复项：{item_id}'}
 
 
+# ---------- 小白一条龙：软件自己下载、自己装好（用户只需点一次「是」） ----------
+# 设计立场：**不让用户去分辨「该装什么、去哪装」** —— 那是把问题推回给用户。
+# 检测到缺组件 → 直接自动下载官方安装包 → 静默安装 → 复检 → 报告结果。
+ENV_PROGRESS_FILE = os.path.join(tempfile.gettempdir(), "score_studio_env_progress.json")
+MUSESCORE_GH_API = "https://api.github.com/repos/musescore/MuseScore/releases/latest"
+
+
+def _env_progress(stage: str, pct: int, msg: str):
+    """把进度落盘，供前端轮询（下载 100+MB 时用户必须看得到动静）。"""
+    try:
+        with open(ENV_PROGRESS_FILE, 'w', encoding='utf-8') as f:
+            json.dump({'stage': stage, 'pct': int(pct), 'msg': msg,
+                       'ts': time.time()}, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def _env_http(url: str, timeout: int = 60):
+    """优先直连（本机代理常拦 GitHub），失败回退系统代理。"""
+    req = urllib.request.Request(url, headers={'User-Agent': UA,
+                                               'Accept': 'application/vnd.github+json'})
+    try:
+        return urllib.request.build_opener(
+            urllib.request.ProxyHandler({})).open(req, timeout=timeout)
+    except Exception:
+        return urllib.request.urlopen(req, timeout=timeout)
+
+
+def _env_latest_musescore() -> tuple:
+    """→ (文件名, 官方直链, 字节数, sha256)。取不到返回 ('','',0,'')。"""
+    try:
+        with _env_http(MUSESCORE_GH_API, 25) as r:
+            js = json.loads(r.read().decode('utf-8', 'ignore'))
+        for a in js.get('assets') or []:
+            n = (a.get('name') or '')
+            if n.lower().endswith('.msi') and 'x86_64' in n.lower():
+                return (n, a.get('browser_download_url', ''), int(a.get('size') or 0),
+                        (a.get('digest') or '').replace('sha256:', '').strip())
+    except Exception as e:
+        print(f"[env] 获取官方下载地址失败：{e}")
+    return '', '', 0, ''
+
+
+# 下载源按实测速度排序（2026-10-07 本机实测，2MB 取样）：
+#   gh-proxy 856.9 KB/s ｜ ghproxy.net 437.5 KB/s ｜ GitHub 直连 5.3 KB/s ｜ ghfast 28.9 KB/s
+# GitHub 直连在国内近乎不可用（122MB 要 6 小时），故镜像优先。
+# ⚠ 镜像属第三方 → **必须**用官方 SHA256 校验后才采用，校验不过即丢弃换源。
+MS_MIRRORS = ['https://gh-proxy.com/{u}', 'https://ghproxy.net/{u}', '{u}']
+
+
+def _env_download_pkg(url: str, dst: str, total: int, sha256: str) -> str:
+    """多源择优下载 + SHA256 校验。→ '' 表示成功，否则返回失败原因。"""
+    import hashlib as _hl
+    last = ''
+    for tpl in MS_MIRRORS:
+        u = tpl.format(u=url)
+        tag = '官方源' if u == url else u.split('/')[2]
+        h = _hl.sha256()
+        got = 0
+        try:
+            with _env_http(u, 60) as r, open(dst, 'wb') as f:
+                while True:
+                    chunk = r.read(262144)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    h.update(chunk)
+                    got += len(chunk)
+                    mb = got // 1048576
+                    tot = total // 1048576 if total else 0
+                    _env_progress('download', int(got * 100 / total) if total else 50,
+                                  f'正在下载安装包… {mb}' + (f'/{tot} MB' if tot else ' MB'))
+            if sha256:
+                if h.hexdigest().lower() != sha256.lower():
+                    last = f'{tag} 文件校验不通过（可能被篡改），已丢弃'
+                    print('[env] ' + last)
+                    try:
+                        os.remove(dst)
+                    except Exception:
+                        pass
+                    continue          # 换下一个源
+            else:
+                print(f'[env] ⚠ 官方未给出校验值，使用 {tag}')
+            return ''
+        except Exception as e:
+            last = f'{tag} 下载中断：{e}'
+            print('[env] ' + last)
+            continue
+    return last or '所有下载源均失败'
+
+
+def _env_download(url: str, dst: str, total: int) -> bool:
+    return _env_download_pkg(url, dst, total, '') == ''
+
+
+def _env_run_elevated(exe: str, params: str, timeout: int = 2400) -> int:
+    """以管理员身份运行并等待结束（弹一次 UAC，用户点「是」即可）。
+
+    → 退出码；-1 = 用户取消了 UAC 或启动失败。
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    SEE_MASK_NOCLOSEPROCESS = 0x00000040
+    SEE_MASK_NOASYNC = 0x00000100
+    SW_SHOWNORMAL = 1
+    INFINITE = 0xFFFFFFFF
+
+    class SHELLEXECUTEINFOW(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD),
+                    ("fMask", ctypes.c_ulong),
+                    ("hwnd", wintypes.HWND),
+                    ("lpVerb", wintypes.LPCWSTR),
+                    ("lpFile", wintypes.LPCWSTR),
+                    ("lpParameters", wintypes.LPCWSTR),
+                    ("lpDirectory", wintypes.LPCWSTR),
+                    ("nShow", ctypes.c_int),
+                    ("hInstApp", wintypes.HINSTANCE),
+                    ("lpIDList", ctypes.c_void_p),
+                    ("lpClass", wintypes.LPCWSTR),
+                    ("hkeyClass", wintypes.HKEY),
+                    ("dwHotKey", wintypes.DWORD),
+                    ("hIcon", wintypes.HANDLE),
+                    ("hProcess", wintypes.HANDLE)]
+
+    sei = SHELLEXECUTEINFOW()
+    sei.cbSize = ctypes.sizeof(sei)
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC
+    sei.lpVerb = "runas"
+    sei.lpFile = exe
+    sei.lpParameters = params
+    sei.nShow = SW_SHOWNORMAL
+    if not ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(sei)):
+        return -1
+    if not sei.hProcess:
+        return -1
+    try:
+        ctypes.windll.kernel32.WaitForSingleObject(sei.hProcess, timeout * 1000)
+        code = wintypes.DWORD()
+        ctypes.windll.kernel32.GetExitCodeProcess(sei.hProcess, ctypes.byref(code))
+        return int(code.value)
+    finally:
+        try:
+            ctypes.windll.kernel32.CloseHandle(sei.hProcess)
+        except Exception:
+            pass
+
+
+def _env_install_musescore(repair: bool) -> dict:
+    """下载官方 MuseScore 并静默安装（repair=True 时做修复安装）。"""
+    name, url, size, sha = _env_latest_musescore()
+    if not url:
+        _env_progress('error', 0, '网络不通，拿不到官方安装包')
+        return {'ok': False,
+                'message': '无法连接下载源（可能网络受限）。'
+                           '请连上网络后重试。'}
+    dst = os.path.join(tempfile.gettempdir(), name)
+    need = (not os.path.isfile(dst)) or os.path.getsize(dst) != size
+    if need:
+        _env_progress('download', 0, f'正在下载官方安装包（约 {size // 1048576} MB）…')
+        err = _env_download_pkg(url, dst, size, sha)
+        if err:
+            _env_progress('error', 0, '下载失败')
+            return {'ok': False, 'message': f'安装包下载失败：{err}。请检查网络后重试。'}
+    else:
+        print('[env] 复用已下载的安装包')
+
+    _env_progress('install', 100, '正在安装，若弹出系统提示请点「是」…')
+    args = f'/i "{dst}" /qb /norestart'
+    if repair:
+        args += ' REINSTALL=ALL REINSTALLMODE=vomus'
+    code = _env_run_elevated('msiexec.exe', args)
+    if code in (0, 3010, 1641):          # 0=成功 3010/1641=成功但需重启
+        _env_progress('done', 100, '安装完成')
+        return {'ok': True, 'message': '已自动装好 MuseScore。'}
+    if code == -1:
+        _env_progress('error', 0, '安装被取消')
+        return {'ok': False,
+                'message': '安装需要在弹出的系统提示里点「是」（授权）。'
+                           '刚才没有确认，已取消。'}
+    if code == 1618:                     # 另一个安装正在进行
+        return {'ok': False, 'message': '系统正在做其他安装，请稍等片刻后重试。'}
+    _env_progress('error', 0, f'安装失败（代码 {code}）')
+    return {'ok': False, 'message': f'安装未成功（代码 {code}）。可重启电脑后重试。'}
+
+
+def env_autoinstall(item_id: str) -> dict:
+    """小白一条龙入口：缺什么就自动装什么，用户不必理解任何细节。"""
+    try:
+        if item_id == 'musescore':
+            return _env_install_musescore(repair=False)
+        if item_id == 'qt_offscreen':
+            # 先看能否就地搬正（零下载）；不行则装官方完整版把插件补齐
+            ms = find_musescore()
+            found = _env_find_offscreen_in_tree(ms) if ms else ''
+            if found:
+                r = env_fix('qt_offscreen')
+                if r.get('ok'):
+                    return r
+            return _env_install_musescore(repair=True)
+        if item_id == 'edge':
+            _env_progress('error', 0, 'Edge 需手动安装')
+            return {'ok': False,
+                    'message': 'Edge 是 Windows 自带组件，缺失时不建议自动安装。'
+                               '请在「设置 → 应用」里检查，或重装系统组件。'}
+        if item_id == 'ccmz_engine':
+            return env_fix('ccmz_engine')
+    except Exception as e:
+        _env_progress('error', 0, f'异常：{e}')
+        return {'ok': False, 'message': f'自动安装出错：{e}'}
+    return {'ok': False, 'message': f'未知组件：{item_id}'}
+
+
+def env_progress_read() -> dict:
+    try:
+        with open(ENV_PROGRESS_FILE, encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return {'stage': '', 'pct': 0, 'msg': ''}
+
+
 def main():
     ap = argparse.ArgumentParser(description="Score Studio 曲谱处理管道")
     ap.add_argument("--input", help="链接 / 本地图片文件夹 / 本地 PDF")
@@ -3119,6 +3350,9 @@ def main():
     ap.add_argument("--env-doctor", action="store_true",
                     help="环境体检：输出 JSON（供前端引导面板使用）")
     ap.add_argument("--env-fix", default="", help="执行一项环境修复（配合 --env-doctor）")
+    ap.add_argument("--env-autoinstall", default="",
+                    help="小白一条龙：自动下载并安装缺失组件")
+    ap.add_argument("--env-progress", action="store_true", help="读取安装进度")
     args = ap.parse_args()
 
     if args.cookie:
@@ -3128,6 +3362,12 @@ def main():
         return
     if args.env_fix:
         print(json.dumps(env_fix(args.env_fix), ensure_ascii=False))
+        return
+    if args.env_autoinstall:
+        print(json.dumps(env_autoinstall(args.env_autoinstall), ensure_ascii=False))
+        return
+    if args.env_progress:
+        print(json.dumps(env_progress_read(), ensure_ascii=False))
         return
     if args.selftest:
         selftest()

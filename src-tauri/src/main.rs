@@ -774,6 +774,31 @@ async fn env_fix(app: tauri::AppHandle, item_id: String) -> String {
     .unwrap_or_else(|_| "{\"ok\":false,\"message\":\"调度失败\"}".into())
 }
 
+/// 小白一条龙：自动下载并安装缺失组件（下载 100+MB，可能数分钟，走后台线程）。
+#[tauri::command]
+async fn env_autoinstall(app: tauri::AppHandle, item_id: String) -> String {
+    tauri::async_runtime::spawn_blocking(move || {
+        let script = resolve_pipeline(&app);
+        let out = run_python_json(&app, &script, &["--env-autoinstall", &item_id]);
+        let last = out.lines().last().unwrap_or("").trim().to_string();
+        if last.starts_with('{') {
+            last
+        } else {
+            format!("{{\"ok\":false,\"message\":\"{}\"}}",
+                    last.replace('"', "'").chars().take(200).collect::<String>())
+        }
+    })
+    .await
+    .unwrap_or_else(|_| "{\"ok\":false,\"message\":\"调度失败\"}".into())
+}
+
+/// 读取安装进度。直接读进度文件，不启 Python（前端每秒轮询，必须够轻）。
+#[tauri::command]
+fn env_progress() -> String {
+    let p = std::env::temp_dir().join("score_studio_env_progress.json");
+    std::fs::read_to_string(p).unwrap_or_else(|_| "{}".into())
+}
+
 /// 用系统默认浏览器打开下载页。**白名单域名**，避免被利用做任意跳转。
 #[tauri::command]
 fn open_url(url: String) -> bool {
@@ -832,6 +857,8 @@ fn main() {
             album_tag_batch,
             env_doctor,
             env_fix,
+            env_autoinstall,
+            env_progress,
             open_url
         ])
         .setup(|app| {
