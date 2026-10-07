@@ -1386,6 +1386,697 @@ def _pdf_cjk_count(pdf_path: str) -> int:
         return -1
 
 
+# ===================== 酷狗「钢琴谱」页面 SVG 反解 =====================
+# 背景：smartGuitar.html 的钢琴谱是**前端用 SVG 现场合成**的 —— 接口数据
+# beatArray[].noteArray 全为空，页面只把和弦按固定织体展开成大谱表。
+# 想要谱面，只能反解页面图元的坐标（坐标由 Node 探针 pulu_svg.mjs 导出）。
+# 本段移植自 kugou-score-to-midi/scripts/piano_svg2mxl.py 的**已验证几何标定**，
+# 勿凭直觉改常数 —— 每一个都是实测标定值。
+import itertools
+
+PSV_ROW_H = 212.0          # 行高
+PSV_ROW_MID_Y = 113.0      # 行 k 纵向中心 = 113 + 212k（就近判行）
+PSV_HIGH_BAND_Y = 48.0     # 高音谱表带顶（第 0 行）
+PSV_LOW_BAND_Y = 141.0     # 低音谱表带顶（第 0 行）
+PSV_BAND_H = 32.0
+PSV_PITCH_STEP = 4.0       # 音级步长
+PSV_HEAD_DY = 1.5          # 符头 bbox 中心相对音级 y 的偏移
+PSV_MEAS_X0 = 56.2         # 小节框原点 x
+PSV_MEAS_W = 210.35        # 每小节宽
+PSV_GRID_N = 8             # 每小节 8 个八分格
+PSV_HEAD_DX = 0.635        # 符头中心 = 格起点 + 0.635 格
+PSV_HIGH_LINE_Y = 80.0     # 第 0 行高音谱表最下线 y
+PSV_HIGH_D0 = 30           # 最下线 = diatonic(E4)
+PSV_LOW_LINE_Y = 173.0     # 第 0 行低音谱表最下线 y
+PSV_LOW_D0 = 18            # 最下线 = diatonic(G2)
+
+PSV_DIV = 480
+PSV_QUARTER, PSV_EIGHTH = 480, 240
+PSV_LETTERS = "CDEFGAB"
+PSV_SHARP_ORDER = "FCGDAEB"
+PSV_FLAT_ORDER = "BEADGCF"
+
+# 调号 -> {音名: alter}。
+# 曾把 A 大调的 {'F','C','G'} 写死，换到 Bb 大调就给 F/C/G 平白加升号，
+# 而**符头数依然完全吻合** —— 数量对、音高错，靠计数发现不了。务必按 fifths 算。
+def _psv_acc_map(fifths: int) -> dict:
+    if fifths > 0:
+        return {s: 1 for s in PSV_SHARP_ORDER[:fifths]}
+    if fifths < 0:
+        return {s: -1 for s in PSV_FLAT_ORDER[:-fifths]}
+    return {}
+
+
+_PSV_ACC = {}
+
+PSV_KIND = {'maj': 'major', 'min': 'minor', 'maj7': 'major-seventh',
+            'min7': 'minor-seventh', '7': 'dominant', '6': 'major-sixth',
+            'm6': 'minor-sixth', 'dim': 'diminished', 'aug': 'augmented',
+            'sus4': 'suspended-fourth', 'sus2': 'suspended-second'}
+
+# 调名 -> fifths。⚠️ 有些曲目 original_tune 写作等音（如 Eb 写成 #D），
+# 一律认 songTone，别被 original_tune 带偏。
+_PSV_TONE_FIFTHS = {
+    'C': 0, 'G': 1, 'D': 2, 'A': 3, 'E': 4, 'B': 5, 'F#': 6, 'C#': 7,
+    'F': -1, 'Bb': -2, 'Eb': -3, 'Ab': -4, 'Db': -5, 'Gb': -6, 'Cb': -7,
+}
+
+
+def _psv_tone_to_fifths(tone: str) -> int:
+    """'Eb' / 'Eb major' → -3；认不出则返回 0（C 大调）。"""
+    s = (tone or '').strip()
+    m = re.match(r'^([A-Ga-g])([#b♯♭]?)', s)
+    if not m:
+        return 0
+    letter = m.group(1).upper()
+    acc = {'#': '#', '♯': '#', 'b': 'b', '♭': 'b'}.get(m.group(2), '')
+    return _PSV_TONE_FIFTHS.get(letter + acc, 0)
+
+
+def _psv_esc(s) -> str:
+    return (str(s) if s is not None else '').replace('&', '&amp;').replace(
+        '<', '&lt;').replace('>', '&gt;').replace('"', '&quot;')
+
+
+def _psv_parse_chord(c: str):
+    """'B:min7' → ('B', 0, 'minor-seventh')；'A' → ('A', 0, 'major')"""
+    if not c:
+        return None
+    root, kind = c.split(':', 1) if ':' in c else (c, 'maj')
+    m = re.match(r'^([A-G])([#b]?)$', root.strip())
+    if not m:
+        return None
+    step, acc = m.group(1), m.group(2)
+    alter = 1 if acc == '#' else (-1 if acc == 'b' else 0)
+    return step, alter, PSV_KIND.get(kind.lower(), 'major')
+
+
+def _psv_parse_heads(raw_path: str) -> dict:
+    """页面图元坐标 JSON → {meas: {'high': {grid: [diatonic,...]}, 'low': {...}}}"""
+    raw = json.load(open(raw_path, encoding='utf-8'))
+    canvases = [s for s in raw if (s.get('cls') or '') == 'page_canvas']
+    if not canvases:
+        raise ValueError("未找到 svg.page_canvas —— 该页面没渲染成「钢琴谱」")
+    items = canvases[0]['items']
+    heads = [i for i in items
+             if i['g'] == 'path' and 6 <= i['w'] <= 8 and 4 <= i['h'] <= 6]
+    if not heads:
+        raise ValueError("页面里没有符头（该谱可能只有和弦，没有钢琴谱视图）")
+
+    out = {}
+    for h in heads:
+        xc = h['x'] + h['w'] / 2.0
+        yc = h['y'] + h['h'] / 2.0
+        k = max(0, round((yc - PSV_ROW_MID_Y) / PSV_ROW_H))
+        base = PSV_ROW_H * k
+        ch = PSV_HIGH_BAND_Y + base + PSV_BAND_H / 2
+        cl = PSV_LOW_BAND_Y + base + PSV_BAND_H / 2
+        staff = 'high' if abs(yc - ch) < abs(yc - cl) else 'low'
+        if staff == 'high':
+            d = round(PSV_HIGH_D0 + (PSV_HIGH_LINE_Y + base + PSV_HEAD_DY - yc) / PSV_PITCH_STEP)
+        else:
+            d = round(PSV_LOW_D0 + (PSV_LOW_LINE_Y + base + PSV_HEAD_DY - yc) / PSV_PITCH_STEP)
+        col = max(0, min(3, int((xc - PSV_MEAS_X0) // PSV_MEAS_W)))
+        grid = round((xc - (PSV_MEAS_X0 + PSV_MEAS_W * col)) / (PSV_MEAS_W / PSV_GRID_N) - PSV_HEAD_DX)
+        grid = max(0, min(PSV_GRID_N - 1, grid))
+        meas = k * 4 + col
+        out.setdefault(meas, {'high': {}, 'low': {}}) \
+           .setdefault(staff, {}).setdefault(grid, []).append(d)
+    return out
+
+
+def _psv_words_by_beat(song: dict) -> dict:
+    """{meas: {beat_idx: [word,...]}}，beat_idx 为小节内 0..3"""
+    ba = song['beatArray']
+    bps = int(song.get('beatPerSection') or 4)
+    out = {}
+    for i, b in enumerate(ba):
+        ws = sorted(b.get('lyricArray') or [], key=lambda w: w.get('startTime', 0))
+        if not ws:
+            continue
+        meas, bi = divmod(i, bps)
+        out.setdefault(meas, {}).setdefault(bi, []).extend(
+            w.get('word') for w in ws if w.get('word'))
+    return out
+
+
+def _psv_assign_words(by_beat: dict, high_grids) -> dict:
+    """把每拍的词分配到该拍覆盖的音符格上；词多于音符时均匀合并。"""
+    res = {}
+    for bi, ws in sorted(by_beat.items()):
+        if not ws:
+            continue
+        targets = [g for g in (2 * bi, 2 * bi + 1) if g in high_grids]
+        if not targets:                       # 该拍无音符 → 就近取后面第一个
+            later = [g for g in sorted(high_grids) if g >= 2 * bi]
+            if not later:
+                continue
+            targets = [later[0]]
+        n, k = len(ws), len(targets)
+        for i, t in enumerate(targets):
+            a, b = round(i * n / k), round((i + 1) * n / k)
+            txt = ' '.join(ws[a:b])
+            if txt:
+                res[t] = (res.get(t, '') + ' ' + txt).strip()
+    return res
+
+
+def _psv_note(d, dur, typ, voice, staff, beam=None, chord=False,
+              lyric=None, rest=False) -> list:
+    """⚠️ 子元素顺序必须严格遵循 MusicXML DTD，notations/lyric 在后 —— 否则 MuseScore 段错误。"""
+    L = ['      <note>']
+    if chord:
+        L.append('        <chord/>')
+    if rest:
+        L.append('        <rest/>')
+    else:
+        step = PSV_LETTERS[d % 7]
+        octv = d // 7
+        alt = _PSV_ACC.get(step, 0)
+        L.append('        <pitch>')
+        L.append(f'          <step>{step}</step>')
+        if alt:
+            L.append(f'          <alter>{alt}</alter>')
+        L.append(f'          <octave>{octv}</octave>')
+        L.append('        </pitch>')
+    L.append(f'        <duration>{dur}</duration>')
+    L.append(f'        <voice>{voice}</voice>')
+    L.append(f'        <type>{typ}</type>')
+    L.append(f'        <staff>{staff}</staff>')
+    if beam:
+        L.append(f'        <beam number="1">{beam}</beam>')
+    if lyric:
+        L.append(f'        <lyric number="1"><syllabic>single</syllabic>'
+                 f'<text>{_psv_esc(lyric)}</text></lyric>')
+    L.append('      </note>')
+    return L
+
+
+def _psv_beam_map(grids) -> dict:
+    """按「拍」分组连符尾（与页面一致：每拍最多 2 个八分连一起）。"""
+    m = {}
+    for _beat, grp in itertools.groupby(sorted(grids), key=lambda g: g // 2):
+        grp = list(grp)
+        if len(grp) >= 2:
+            for i, g in enumerate(grp):
+                m[g] = 'begin' if i == 0 else ('end' if i == len(grp) - 1 else 'continue')
+    return m
+
+
+def _psv_gen_voice(ng: dict, voice: int, staff: int, words=None) -> tuple:
+    """ng: {grid: [diatonic,...]}；返回 (xml 行, 总时值 tick)"""
+    lines, total = [], 0
+    bm = _psv_beam_map(ng.keys())
+    g = 0
+    while g < PSV_GRID_N:
+        if g in ng:
+            ds = sorted(ng[g])
+            for i, d in enumerate(ds):
+                lines += _psv_note(
+                    d, PSV_EIGHTH, 'eighth', voice, staff,
+                    beam=bm.get(g) if i == 0 else None,
+                    chord=(i > 0),
+                    lyric=(words or {}).get(g) if i == 0 else None)
+            total += PSV_EIGHTH
+            g += 1
+        else:
+            j = g
+            while j < PSV_GRID_N and j not in ng:
+                j += 1
+            gg = g
+            while gg < j:                       # 按拍边界决定休止符时值
+                beat_end = (gg // 2 + 1) * 2
+                seg = min(j, beat_end) - gg
+                if seg >= 2:
+                    lines += _psv_note(None, PSV_QUARTER, 'quarter', voice, staff, rest=True)
+                    total += PSV_QUARTER
+                else:
+                    lines += _psv_note(None, PSV_EIGHTH, 'eighth', voice, staff, rest=True)
+                    total += PSV_EIGHTH
+                gg += seg
+            g = j
+    return lines, total
+
+
+def _psv_harmony(chord: str) -> list:
+    p = _psv_parse_chord(chord)
+    if not p:
+        return []
+    step, alt, kind = p
+    s = '      <harmony><root>'
+    s += f'<root-step>{step}</root-step>'
+    if alt:
+        s += f'<root-alter>{alt}</root-alter>'
+    s += '</root>'
+    s += f'<kind>{kind}</kind></harmony>'
+    return [s]
+
+
+def psv_piano_to_musicxml(raw_path: str, song: dict, fifths: int = 0,
+                          title: str = "", single: bool = True) -> tuple:
+    """页面图元 + beat 数据 → MusicXML（single=True 只出高音谱表 = 小提琴单行版）。
+
+    返回 (xml, 统计 dict)。
+    ⚠️ 产物**自带歌词**（由 assign_words 从 beatArray 分配），不要再注入。
+    """
+    global _PSV_ACC
+    _PSV_ACC = _psv_acc_map(fifths)
+    heads = _psv_parse_heads(raw_path)
+    ba = song['beatArray']
+    bps = int(song.get('beatPerSection') or 4)
+    nmeas = (len(ba) + bps - 1) // bps
+    title = title or song.get('songName') or 'Untitled'
+    singer = song.get('singerName') or ''
+    bpm = round(float(song.get('songBPM') or 100))
+    wb = _psv_words_by_beat(song)
+
+    chords = []
+    for m in range(nmeas):
+        c = ba[m * bps].get('chord') if m * bps < len(ba) else ''
+        chords.append(c or (chords[-1] if chords else ''))
+
+    pname = 'Violin' if single else 'Piano'
+    prog = '41' if single else '1'
+
+    out = ['<?xml version="1.0" encoding="UTF-8"?>',
+           '<!DOCTYPE score-partwise PUBLIC "-//Recordare//DTD MusicXML 4.0 Partwise//EN" '
+           '"http://www.musicxml.org/dtds/partwise.dtd">',
+           '<score-partwise version="4.0">',
+           f'  <work><work-title>{_psv_esc(title)}</work-title></work>',
+           f'  <identification><creator type="composer">Pulu</creator>'
+           f'<creator type="lyricist">{_psv_esc(singer)}</creator></identification>',
+           f'  <part-list><score-part id="P1"><part-name>{pname}</part-name>',
+           f'    <score-instrument id="P1-I1"><instrument-name>{pname}</instrument-name>'
+           '</score-instrument>',
+           f'    <midi-instrument id="P1-I1"><midi-channel>1</midi-channel>'
+           f'<midi-program>{prog}</midi-program></midi-instrument>',
+           '  </score-part></part-list>',
+           '  <part id="P1">']
+
+    warnings = []
+    n_note = n_lyric = 0
+    for m in range(nmeas):
+        h = heads.get(m, {'high': {}, 'low': {}})
+        hi, lo = h.get('high', {}), h.get('low', {})
+        words = _psv_assign_words(wb.get(m, {}), hi)
+        out.append(f'    <measure number="{m + 1}">')
+        if m == 0:
+            out.append('      <attributes>')
+            out.append(f'        <divisions>{PSV_DIV}</divisions>')
+            out.append(f'        <key><fifths>{fifths}</fifths></key>')
+            out.append(f'        <time><beats>{bps}</beats><beat-type>4</beat-type></time>')
+            out.append(f'        <staves>{1 if single else 2}</staves>')
+            out.append('        <clef number="1"><sign>G</sign><line>2</line></clef>')
+            if not single:
+                out.append('        <clef number="2"><sign>F</sign><line>4</line></clef>')
+            out.append('      </attributes>')
+            out.append('      <direction placement="above"><direction-type><metronome>'
+                       f'<beat-unit>quarter</beat-unit><per-minute>{bpm}</per-minute>'
+                       f'</metronome></direction-type><sound tempo="{bpm}"/></direction>')
+        out += _psv_harmony(chords[m])
+
+        vl, t1 = _psv_gen_voice(hi, 1, 1, words)
+        out += vl
+        if single:
+            if t1 != bps * PSV_DIV:
+                warnings.append(f'小节{m + 1}: 高音{t1}（应为 {bps * PSV_DIV}）')
+            out.append('    </measure>')
+            continue
+        out.append(f'      <backup><duration>{t1}</duration></backup>')
+        v2, t2 = _psv_gen_voice(lo, 2, 2)
+        out += v2
+        if t1 != bps * PSV_DIV or t2 != bps * PSV_DIV:
+            warnings.append(f'小节{m + 1}: 高音{t1} 低音{t2}（应为 {bps * PSV_DIV}）')
+        while t2 < t1:
+            out.append(f'      <forward><duration>{PSV_EIGHTH}</duration></forward>')
+            t2 += PSV_EIGHTH
+        out.append('    </measure>')
+    out.append('  </part>')
+    out.append('</score-partwise>')
+
+    xml = '\n'.join(out)
+    n_note = len(re.findall(r'<note[ >]', xml))
+    n_lyric = len(re.findall(r'<lyric', xml))
+    return xml, {'measures': nmeas, 'page_measures': len(heads), 'notes': n_note,
+                 'lyrics': n_lyric, 'warnings': warnings, 'title': title,
+                 'singer': singer, 'bpm': bpm, 'fifths': fifths, 'single': single}
+
+
+# ---------- 纯 Python CDP：驱动系统 Edge 取页面图元（零外部依赖） ----------
+# 为什么不用 Node/puppeteer：安装包（NSIS，1.3MB）根本不含 ccmz-engine（115MB），
+# 用户机器上未必有；而 Win10+ 自带 Edge。手写 RFC6455 文本帧即可直连 CDP，
+# 与 Puppeteer/Playwright 等效，且不增加任何分发包体积。
+_PSV_EXTRACT_JS = """(() => {
+  const res = [];
+  document.querySelectorAll('svg').forEach((svg, si) => {
+    let root; try { root = svg.getScreenCTM(); } catch (e) { return; }
+    if (!root) return;
+    const inv = root.inverse();
+    const r = svg.getBoundingClientRect();
+    const items = [];
+    svg.querySelectorAll('path,rect,ellipse,circle,line,polyline,polygon,text').forEach(el => {
+      let b; try { b = el.getBBox(); } catch (e) { return; }
+      if (!b || (b.width === 0 && b.height === 0)) return;
+      let m; try { m = el.getScreenCTM(); } catch (e) { return; }
+      if (!m) return;
+      const t = inv.multiply(m);
+      const p1 = new DOMPoint(b.x, b.y).matrixTransform(t);
+      const p2 = new DOMPoint(b.x + b.width, b.y + b.height).matrixTransform(t);
+      items.push({
+        g: el.tagName.toLowerCase(),
+        x: +Math.min(p1.x, p2.x).toFixed(2),
+        y: +Math.min(p1.y, p2.y).toFixed(2),
+        w: +Math.abs(p2.x - p1.x).toFixed(2),
+        h: +Math.abs(p2.y - p1.y).toFixed(2),
+        t: el.tagName.toLowerCase() === 'text' ? (el.textContent || '').slice(0, 12) : null,
+        d: (el.getAttribute('d') || '').slice(0, 80)
+      });
+    });
+    res.push({svg: si, cls: svg.getAttribute('class') || '',
+              vb: svg.getAttribute('viewBox'),
+              cw: +r.width.toFixed(1), ch: +r.height.toFixed(1),
+              n: items.length, items: items});
+  });
+  return res;
+})()"""
+
+
+class _CdpWs:
+    """极简 WebSocket 客户端（仅文本帧 + 分片重组 + ping/pong）——够跑 CDP 用。"""
+
+    def __init__(self, ws_url: str, timeout: float = 20.0):
+        import socket as _socket
+        m = re.match(r'ws://([^/:]+):(\d+)(/.*)$', ws_url)
+        if not m:
+            raise ValueError(f"无法解析 WebSocket 地址：{ws_url}")
+        host, port, path = m.group(1), int(m.group(2)), m.group(3)
+        self.sock = _socket.create_connection((host, port), timeout=timeout)
+        self.sock.settimeout(timeout)
+        key = _b64.b64encode(os.urandom(16)).decode()
+        req = (f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+               "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+               f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n")
+        self.sock.sendall(req.encode())
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise ValueError("WebSocket 握手失败：连接被关闭")
+            buf += chunk
+        head, self.buf = buf.split(b"\r\n\r\n", 1)
+        if b" 101 " not in head.split(b"\r\n")[0]:
+            raise ValueError(f"WebSocket 握手失败：{head.split(b'\\r\\n')[0][:120]!r}")
+        self._id = 0
+        self.results = {}
+
+    def _read(self, n: int) -> bytes:
+        while len(self.buf) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise ValueError("CDP 连接已关闭")
+            self.buf += chunk
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def _frame(self, opcode: int, data: bytes):
+        hdr = bytearray([0x80 | opcode])
+        n = len(data)
+        if n < 126:
+            hdr.append(0x80 | n)
+        elif n < 65536:
+            hdr.append(0x80 | 126)
+            hdr += n.to_bytes(2, 'big')
+        else:
+            hdr.append(0x80 | 127)
+            hdr += n.to_bytes(8, 'big')
+        mask = os.urandom(4)
+        hdr += mask
+        self.sock.sendall(bytes(hdr) + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+    def _recv_msg(self) -> str:
+        parts = []
+        while True:
+            h = self._read(2)
+            fin, opcode = h[0] & 0x80, h[0] & 0x0F
+            masked, ln = h[1] & 0x80, h[1] & 0x7F
+            if ln == 126:
+                ln = int.from_bytes(self._read(2), 'big')
+            elif ln == 127:
+                ln = int.from_bytes(self._read(8), 'big')
+            mask = self._read(4) if masked else b""
+            data = self._read(ln) if ln else b""
+            if mask:
+                data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+            if opcode == 0x8:
+                raise ValueError("CDP 连接被浏览器关闭")
+            if opcode == 0x9:
+                self._frame(0xA, data)
+                continue
+            if opcode == 0xA:
+                continue
+            parts.append(data)
+            if fin:
+                return b"".join(parts).decode('utf-8', 'replace')
+
+    def call(self, method: str, params: dict = None):
+        self._id += 1
+        mid = self._id
+        self._frame(0x1, json.dumps({'id': mid, 'method': method,
+                                     'params': params or {}}).encode())
+        while True:
+            msg = json.loads(self._recv_msg())
+            if msg.get('id') == mid:
+                if msg.get('error'):
+                    raise ValueError(f"CDP {method} 失败：{msg['error']}")
+                return msg.get('result') or {}
+            # 其余为事件（Page.loadEventFired 等），忽略
+
+    def close(self):
+        try:
+            self._frame(0x8, b"")
+        except Exception:
+            pass
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+
+def _pulu_find_edge() -> str:
+    """定位系统 Edge（Win10+ 自带）。"""
+    fn = globals().get('_find_edge')
+    if callable(fn):
+        e = fn()
+        if e:
+            return e
+    cands = [
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Edge\Application\msedge.exe"),
+    ]
+    for c in cands:
+        if os.path.isfile(c):
+            return c
+    return ""
+
+
+_PSV_MOBILE_UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) "
+                  "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 "
+                  "Mobile/15E148 Safari/604.1")
+
+
+def _pulu_page_svg(url: str, out_json: str, wait: int = 15) -> bool:
+    """用系统 Edge（无头）+ 原生 CDP 打开页面，导出 SVG 图元坐标。
+
+    步骤与已验证的 Playwright 版一致：移动端 UA → 等首屏 → 滚到底触发懒加载
+    → 回顶 → 取图元。页面必须按移动端渲染，桌面上取不到钢琴谱布局。
+    """
+    import shutil as _sh
+    import urllib.request as _ur
+    edge = _pulu_find_edge()
+    if not edge:
+        raise ValueError("未找到 Microsoft Edge（Win10+ 系统自带）。请确认 Edge 已安装。")
+
+    port = 52000 + (os.getpid() % 500)
+    profile = tempfile.mkdtemp(prefix="pulu_edge_")
+    child = None
+    ws = None
+    try:
+        args = [
+            edge,
+            '--headless=new',
+            '--disable-gpu',
+            '--no-sandbox',
+            '--disable-dev-shm-usage',
+            '--no-proxy-server',              # 本机代理会拦死 h5.kugou.com
+            '--no-first-run',
+            '--no-default-browser-check',
+            '--remote-allow-origins=*',
+            f'--user-agent={_PSV_MOBILE_UA}',
+            '--window-size=900,1600',
+            f'--remote-debugging-port={port}',
+            f'--user-data-dir={profile}',
+            url,
+        ]
+        print("[pulu] 渲染钢琴谱页面（无头 Edge，约 30~60 秒）…")
+        child = subprocess.Popen(args, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+
+        # 轮询 CDP：直到出现目标页面
+        target = None
+        for _ in range(60):
+            time.sleep(0.5)
+            try:
+                with _ur.urlopen(f'http://127.0.0.1:{port}/json/list', timeout=2) as r:
+                    lst = json.loads(r.read().decode('utf-8', 'ignore'))
+            except Exception:
+                continue
+            pages = [t for t in lst if t.get('type') == 'page'
+                     and t.get('webSocketDebuggerUrl')]
+            if pages:
+                target = pages[0]
+                break
+        if not target:
+            raise ValueError("Edge 调试端口未就绪（可能被安全软件拦截）。")
+
+        ws = _CdpWs(target['webSocketDebuggerUrl'], timeout=90)
+        ws.call('Page.enable')
+        time.sleep(max(1, wait))                                   # 首屏渲染
+        ws.call('Runtime.evaluate',
+                {'expression': 'window.scrollTo(0, document.body.scrollHeight)'})
+        time.sleep(6)                                              # 触发懒加载
+        ws.call('Runtime.evaluate', {'expression': 'window.scrollTo(0, 0)'})
+        time.sleep(3)
+        res = ws.call('Runtime.evaluate', {'expression': _PSV_EXTRACT_JS,
+                                           'returnByValue': True})
+        data = ((res.get('result') or {}).get('value'))
+        if not isinstance(data, list):
+            raise ValueError("页面未返回图元数据（页面可能未渲染完成）。")
+
+        canvas = [s for s in data if (s.get('cls') or '') == 'page_canvas']
+        heads = 0
+        for c in canvas:
+            heads += sum(1 for i in c.get('items', [])
+                         if i.get('g') == 'path' and 6 <= i.get('w', 0) <= 8
+                         and 4 <= i.get('h', 0) <= 6)
+        for s in data:
+            if (s.get('cls') or '') == 'page_canvas' or s.get('n', 0) > 50:
+                print(f"  svg#{s.get('svg')} cls={s.get('cls')!r} "
+                      f"{s.get('cw')}x{s.get('ch')} 图元={s.get('n')}")
+        with open(out_json, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False)
+        print(f"  符头数 = {heads}")
+        if not canvas or heads == 0:
+            raise ValueError("页面里没有符头 —— 该曲可能只有和弦谱，没有钢琴谱视图。")
+        return True
+    finally:
+        if ws:
+            ws.close()
+        if child:
+            try:
+                child.terminate()
+                child.wait(timeout=6)
+            except Exception:
+                try:
+                    child.kill()
+                except Exception:
+                    pass
+        _sh.rmtree(profile, ignore_errors=True)
+
+
+def _pulu_piano_path(input_str: str, output_dir: str, custom: str = "") -> str:
+    """弹唱谱（数据层无旋律）→ 反解页面钢琴谱 → 单行小提琴版 PDF。"""
+    opern_id = _pulu_parse_opernid(input_str)
+    js = _pulu_fetch(opern_id, opern_id.split('_')[1])
+    data = js.get('data') or {}
+    info = data.get('opern_info') or {}
+    smart = data.get('smart_opern_info') or {}
+
+    jump = (info.get('jump_url') or smart.get('jump_url') or '')
+    # ⚠ 优先用**用户实际分享的链接**，只把 sheetType 钉成 3（钢琴谱视图）。
+    # 不要改用它给的 jump_url：jump_url 带 sheetDataType=0，渲染出的布局与分享页不同
+    # （《暁の車》实测：jump_url 高音谱表 905 符头，分享链接 643 符头 —— 后者才是
+    #  已验证的正确版本）。jump_url 仅作「分享链接没带 opernid」时的兜底。
+    base = input_str if _pulu_parse_opernid(input_str) else jump
+    if not base:
+        raise ValueError("接口未给出曲谱页面地址（jump_url 为空），无法反解。")
+    url = re.sub(r'(?<=[?&])sheetType=\d+', 'sheetType=3', base)
+    if 'sheetType=' not in url:
+        url += ('&' if '?' in url else '?') + 'sheetType=3'
+    print(f"[pulu] 钢琴谱页面：{url.split('?')[0]}…sheetType=3")
+
+    basis = info.get('basis_opern_file') or smart.get('basis_opern_file') or ''
+    if not basis:
+        raise ValueError("接口未给出谱面数据直链（basis_opern_file 为空），无法反解。")
+
+    song = (data.get('song_name') or '').strip() or '酷狗曲谱'
+    singer = (data.get('singer_name') or '').strip()
+
+    tmpdir = tempfile.mkdtemp(prefix="pulu_svg_")
+    try:
+        # ① 取 beat 数据（含和弦/歌词/速度/调）
+        raw = _pulu_download(basis)
+        obj = json.loads(raw.decode('utf-8', 'ignore'))
+        sm = obj.get('sheetMusic') or []
+        if not sm:
+            raise ValueError("谱面数据为空（sheetMusic 缺失）")
+        songobj = json.loads(sm[0]) if isinstance(sm[0], str) else sm[0]
+        ba = songobj.get('beatArray') or []
+        n_note = sum(len(b.get('noteArray') or []) for b in ba)
+        n_lyr = sum(len(b.get('lyricArray') or []) for b in ba)
+        print(f"[pulu] 弹唱谱数据：{len(ba)} 拍 · 和弦 "
+              f"{sum(1 for b in ba if b.get('chord'))} · 歌词 {n_lyr} · 音符 {n_note}")
+        if n_note:
+            print("[pulu] ⚠ 数据层竟含音符，但无五线谱直链，仍按页面反解处理")
+
+        f = _psv_tone_to_fifths(songobj.get('songTone') or songobj.get('songOriginalTone'))
+        print(f"[pulu] 调号：{songobj.get('songTone') or '?'} → fifths={f}")
+
+        # ② 无头 Edge 取页面 SVG 坐标
+        probe = os.path.join(tmpdir, "probe.json")
+        _pulu_page_svg(url, probe)
+
+        # ③ 反解为单谱表 MusicXML
+        xml, st = psv_piano_to_musicxml(
+            probe, songobj, fifths=f, title=custom or song, single=True)
+        print(f"[pulu] 反解：谱行 {st['page_measures']} 小节（总 {st['measures']}）× 单谱表 · "
+              f"音符 {st['notes']} · 歌词 {st['lyrics']} · 时值异常 {len(st['warnings'])}")
+        if not st['lyrics']:
+            print("[pulu] ⚠ 未分配出歌词（该曲可能无人声对轴歌词）")
+        if st['notes'] < 20:
+            raise ValueError(
+                f"反解出的音符过少（{st['notes']} 个），页面可能没有钢琴谱视图。\n"
+                "该曲在酷狗可能只有和弦谱。")
+
+        xml_tmp = os.path.join(tmpdir, "score.musicxml")
+        with open(xml_tmp, 'w', encoding='utf-8', newline='') as fh:
+            fh.write(xml)
+
+        ms = find_musescore()
+        if not ms:
+            raise ValueError(
+                "未找到 MuseScore（曲谱排版引擎，免费开源）。\n"
+                "请先安装 MuseScore 4：https://musescore.org/zh-hans/download\n"
+                "装好后本软件会自动识别，无需配置。")
+        stem = f"{song}-{singer}" if singer else song
+        os.makedirs(output_dir, exist_ok=True)
+        out = os.path.join(output_dir, safe_name(f"{stem}-小提琴") + ".pdf")
+        if not mxl2pdf(ms, xml_tmp, out):
+            raise ValueError("MuseScore 排版失败（未产出 PDF），请重试。")
+        cn = _pdf_cjk_count(out)
+        print(f"[pulu] 自检：残留属性=0 PDF汉字={cn}")
+        if cn == 0:
+            raise ValueError("自检未通过：PDF 中未检出任何中文（中文字体渲染失败）")
+        print(f"✅ PDF 已生成：{out}（{os.path.getsize(out)} 字节 · 酷狗钢琴谱反解 小提琴单行版）")
+        return out
+    finally:
+        try:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
+
+
 def _pulu_probe_versions(opern_id: str) -> tuple:
     """同曲其他曲谱版本探测 → (opern_id, js) 或 ("", None)。
 
@@ -1462,11 +2153,11 @@ def process_pulu(input_str: str, output_dir: str, custom: str = "") -> str:
             info = data.get('opern_info') or {}
             levels = info.get('opern_level_file') or {}
         else:
-            raise ValueError(
-                f"该曲在酷狗只有「{kind or '非五线谱'}」版本（{draw or '无五线谱数据'}），"
-                "数据里只有和弦与歌词、没有旋律音符，无法排成小提琴五线谱。\n"
-                "已自动探测同曲其他版本，未找到五线谱/钢琴谱版。\n"
-                "建议：在酷狗 App 里搜这首歌，挑带「五线谱」或「钢琴谱」标记的版本再分享。")
+            # ③ 兜底出路：页面钢琴谱反解。
+            # 数据层确实没有旋律，但**页面会用 SVG 现场合成钢琴大谱表** ——
+            # 反解页面图元就能拿到有音高的谱面（《暁の車》实测 1113 符头）。
+            print(f"[pulu] 该曲只有「{kind or '非五线谱'}」数据，改走页面钢琴谱反解…")
+            return _pulu_piano_path(input_str, output_dir, custom=custom)
 
     key = PULU_WANT_LEVEL if PULU_WANT_LEVEL in levels else sorted(levels)[0]
     level = PULU_LEVEL.get(key, f"L{key}")
