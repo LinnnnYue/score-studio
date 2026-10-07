@@ -1251,7 +1251,7 @@ def _pulu_parse_opernid(url: str) -> str:
     return m.group(1) if m else ""
 
 
-def _pulu_fetch(opern_id: str, instruments: str = '1') -> dict:
+def _pulu_fetch(opern_id: str, instruments: str = '1', timeout: int = 25) -> dict:
     """网关签名请求：salt + 按 key 升序的 k=v 拼接 + salt → MD5。"""
     from urllib.parse import quote
     ct = str(int(time.time() * 1000))
@@ -1270,7 +1270,7 @@ def _pulu_fetch(opern_id: str, instruments: str = '1') -> dict:
         'Referer': 'https://h5.kugou.com/',
         'Accept': 'application/json, text/plain, */*',
     })
-    with _pulu_opener().open(req, timeout=25) as r:
+    with _pulu_opener().open(req, timeout=timeout) as r:
         return json.loads(r.read().decode('utf-8'))
 
 
@@ -1386,6 +1386,40 @@ def _pdf_cjk_count(pdf_path: str) -> int:
         return -1
 
 
+def _pulu_probe_versions(opern_id: str) -> tuple:
+    """同曲其他曲谱版本探测 → (opern_id, js) 或 ("", None)。
+
+    场景：分享链接指向「AI弹唱谱（六线谱/和弦谱）」——这类谱只有和弦 + 歌词，
+    数据里 noteArray 全空、**没有旋律音符**，排不出五线谱。
+    但同一首歌常在酷狗存有多份曲谱（五线谱/钢琴谱/独奏谱），
+    opern_id 形如 <歌曲ID>_<乐器>_<难度>，枚举后段即可找到可用的那份。
+    """
+    song_id = opern_id.split('_')[0]
+    if not song_id.isdigit():
+        return "", None
+    print(f"[pulu] 探测同曲其他版本（{song_id}_{{1..8}}_{{0..2}}）…")
+    # 第 2 段 = 乐器编码，实测 5 最常见（独奏/钢琴）；先试它以提高命中速度。
+    # 网络不容乐观：单请求 8s 超时 + 全程 30s 预算，超预算就放弃（绝不能让用户干等）。
+    order_a = [5, 1, 2, 3, 4, 6, 7, 8]
+    deadline = time.time() + 30
+    for b in (0, 1, 2):
+        for a in order_a:
+            if time.time() > deadline:
+                print("[pulu] 探测超时（30s），停止枚举")
+                return "", None
+            oid = f"{song_id}_{a}_{b}"
+            if oid == opern_id:
+                continue
+            try:
+                js = _pulu_fetch(oid, str(a), timeout=8)
+            except Exception:
+                continue
+            info = ((js.get('data') or {}).get('opern_info')) or {}
+            if info.get('opern_level_file'):
+                return oid, js
+    return "", None
+
+
 def process_pulu(input_str: str, output_dir: str, custom: str = "") -> str:
     """酷狗分享链接 → Medium 档「小提琴单行版（含歌词）」矢量 PDF。
 
@@ -1408,17 +1442,40 @@ def process_pulu(input_str: str, output_dir: str, custom: str = "") -> str:
     data = js.get('data') or {}
     info = data.get('opern_info') or {}
     levels = info.get('opern_level_file') or {}
+
     if not levels:
-        raise ValueError(
-            "该曲谱在酷狗侧不存在或已下架（接口 data.opern_info 为空）。\n"
-            "换参数无用 —— 请确认分享链接有效，或换一首重新分享。")
+        # 三类可能，逐一甄别（切勿一律报「已下架」——那是误诊）
+        kind = info.get('opern_type_name') or ''
+        draw = info.get('opern_draw_type_name') or ''
+        if not info and not data:
+            raise ValueError(
+                "该曲谱在酷狗侧不存在或已下架（接口 data.opern_info 为空）。\n"
+                "请确认分享链接有效，或换一首重新分享。")
+        # ① 弹唱谱 / 六线谱等非五线谱源 → 有旋律数据吗？
+        print(f"[pulu] 该 opern 类型为「{kind or '未知'}」（{draw or '未知绘制类型'}），"
+              f"不含五线谱直链")
+        alt_id, alt_js = _pulu_probe_versions(opern_id)
+        if alt_id:
+            print(f"[pulu] ✓ 已切换到同曲的五线谱版：{alt_id}")
+            opern_id, js = alt_id, alt_js
+            data = js.get('data') or {}
+            info = data.get('opern_info') or {}
+            levels = info.get('opern_level_file') or {}
+        else:
+            raise ValueError(
+                f"该曲在酷狗只有「{kind or '非五线谱'}」版本（{draw or '无五线谱数据'}），"
+                "数据里只有和弦与歌词、没有旋律音符，无法排成小提琴五线谱。\n"
+                "已自动探测同曲其他版本，未找到五线谱/钢琴谱版。\n"
+                "建议：在酷狗 App 里搜这首歌，挑带「五线谱」或「钢琴谱」标记的版本再分享。")
 
     key = PULU_WANT_LEVEL if PULU_WANT_LEVEL in levels else sorted(levels)[0]
     level = PULU_LEVEL.get(key, f"L{key}")
     if key != PULU_WANT_LEVEL:
         print(f"[pulu] ⚠ 该曲无 Medium 档（可用档位：{sorted(levels)}），已降级为 {level}")
-    song = (data.get('song_name') or info.get('opern_name') or '').strip() or '酷狗曲谱'
-    singer = (data.get('singer_name') or info.get('author_name') or '').strip()
+    # 曲名/歌手只认 data 顶层字段：info.opern_name 是「曲谱类型名」（如"弹唱谱"），
+    # info.opern_author 是制谱者（如"曲谱助手"），二者都不是曲名/歌手。
+    song = (data.get('song_name') or '').strip() or '酷狗曲谱'
+    singer = (data.get('singer_name') or '').strip()
     print(f"[pulu] 曲名={song} · 歌手={singer or '-'} · 档位={level}")
 
     ms = find_musescore()
