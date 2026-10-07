@@ -1352,10 +1352,45 @@ def find_musescore() -> str:
     return ""
 
 
-def mxl2pdf(ms: str, xml_path: str, pdf_path: str, timeout: int = 300) -> bool:
-    """MusicXML → PDF（MuseScore CLI 无头）。三件套缺一不可，判据只看产物文件。"""
+def _qt_platform_env(ms: str) -> dict:
+    """按 MuseScore **实际携带的**平台插件决定 QT_QPA_PLATFORM。
+
+    ⚠️ 2026-10-07 老公机器实测踩坑：曾在此硬编码 `QT_QPA_PLATFORM=offscreen`，
+    而部分 MuseScore 安装**只带 qwindows.dll、不带 qoffscreen.dll** →
+    Qt 直接弹「This application failed to start because no Qt platform plugin
+    could be initialized（Available platform plugins are: windows）」，
+    且该对话框是**模态的**，进程一直不退出 → 整个转换卡到超时。
+    本机恰好两件插件都齐，所以开发时完全没暴露。
+
+    策略：有 offscreen 才用（无窗口、不弹框、无桌面会话也能跑）；
+    只有 windows 就用默认（**绝不能设 offscreen**）；探测不到则保守用默认。
+    """
+    base = os.path.dirname(_clean_win_path(ms))
+    for d in (os.path.join(base, 'platforms'),
+              os.path.join(base, 'plugins', 'platforms'),
+              os.path.join(os.path.dirname(base), 'plugins', 'platforms')):
+        if not os.path.isdir(d):
+            continue
+        try:
+            names = [f.lower() for f in os.listdir(d)]
+        except Exception:
+            continue
+        if any('offscreen' in n for n in names):
+            return {'QT_QPA_PLATFORM': 'offscreen'}
+        if any('windows' in n for n in names):
+            print("[排版] MuseScore 未附带 offscreen 插件，改用默认窗口平台")
+            return {}
+    return {}
+
+
+def mxl2pdf(ms: str, xml_path: str, pdf_path: str, timeout: int = 150) -> bool:
+    """MusicXML → PDF（MuseScore CLI）。判据只看产物文件。
+
+    用 Popen + 轮询而非 run(timeout)：某些环境下 MuseScore 转完**不自动退出**
+    （弹窗/已有一实例），若等进程结束会白等到超时。产物落盘且大小稳定即算成功。
+    """
     env = dict(os.environ)
-    env['QT_QPA_PLATFORM'] = 'offscreen'     # 缺 → 无 GUI 会话下初始化窗口栈，挂起数分钟
+    env.update(_qt_platform_env(ms))          # 平台插件按实际探测，别硬编码
     env['QT_QPA_FONTDIR'] = os.path.join(     # 缺 → 中文歌词在 PDF 里渲染不出来
         os.environ.get('SystemRoot', r'C:\Windows'), 'Fonts')
     if os.path.exists(pdf_path):
@@ -1363,15 +1398,52 @@ def mxl2pdf(ms: str, xml_path: str, pdf_path: str, timeout: int = 300) -> bool:
             os.remove(pdf_path)
         except Exception:
             pass
+
+    proc = None
     try:
-        subprocess.run([ms, '-o', pdf_path, xml_path], env=env,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                       timeout=timeout, cwd=os.path.dirname(xml_path))
-    except subprocess.TimeoutExpired:
-        print(f"[pulu] MuseScore 转换超时（{timeout}s）")
+        proc = subprocess.Popen([ms, '-o', pdf_path, xml_path], env=env,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                cwd=os.path.dirname(xml_path))
     except Exception as e:
-        print(f"[pulu] MuseScore 调用异常：{e}")
-    return os.path.isfile(pdf_path) and os.path.getsize(pdf_path) > 0
+        print(f"[排版] MuseScore 调用异常：{e}")
+        return False
+
+    deadline = time.time() + timeout
+    stable = 0
+    last = -1
+    try:
+        while time.time() < deadline:
+            time.sleep(1.0)
+            if os.path.isfile(pdf_path):
+                try:
+                    size = os.path.getsize(pdf_path)
+                except OSError:
+                    size = 0
+                if size > 0 and size == last:
+                    stable += 1
+                    if stable >= 2:           # 连续两次大小不变 → 写盘完成
+                        print(f"[排版] PDF 已产出（{size} 字节）")
+                        return True
+                else:
+                    stable = 0
+                last = size
+            if proc.poll() is not None:
+                # 进程已退出：给它 3 秒缓冲再看一次产物
+                time.sleep(3)
+                if os.path.isfile(pdf_path) and os.path.getsize(pdf_path) > 0:
+                    return True
+                break
+    finally:
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    if not (os.path.isfile(pdf_path) and os.path.getsize(pdf_path) > 0):
+        print(f"[排版] MuseScore 未产出 PDF（超时 {timeout}s）——"
+              f"可能弹出了对话框等待点击，或首次运行正在初始化音源")
+        return False
+    return True
 
 
 def _pdf_cjk_count(pdf_path: str) -> int:
