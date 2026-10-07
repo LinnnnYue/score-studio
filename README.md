@@ -66,7 +66,7 @@ Tauri 2 · Python 子进程管线 · 无边框窗口 · 本地优先
 ### 下载与启动
 | 形式 | 适合 | 说明 |
 | --- | --- | --- |
-| **Windows 安装包** `Score Studio_0.3.2_x64-setup.exe` | 想放开始菜单 / 卸载列表 | 自动写入开始菜单 / 卸载项 |
+| **Windows 安装包** `Score Studio_0.3.7_x64-setup.exe` | 想放开始菜单 / 卸载列表 | 自动写入开始菜单 / 卸载项 |
 | **便携 zip** `Score-Studio-Portable_x64.zip` | 绿色便携、拷 U 盘 | 解压后直接双击 `score-studio.exe`，不写注册表 |
 
 1. 去 [Releases](https://github.com/LinnnnYue/score-studio/releases) 下载最新版本
