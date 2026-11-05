@@ -42,6 +42,8 @@ Tauri 2 · Python 子进程管线 · 无边框窗口 · 本地优先
 
 产出为**可缩放不失真的矢量 PDF**，体积约为位图版的 1/20。
 
+> 酷狗自 2026-11 起把曲谱直链换成私有加密格式（KQPU）。软件会**自动从页面读取解密后的原始 MusicXML** —— 调号、临时升降记号、精确时值、歌词全部完整保留，不是像素反解，也不是网页截图。页面未给出该数据时才降级为自适应反解。
+
 > 弹唱谱反解只依赖 **系统 Microsoft Edge**（Win10+ 自带），无需另装浏览器或运行时。
 
 ### II. 曲库 · 形制墙
@@ -66,7 +68,7 @@ Tauri 2 · Python 子进程管线 · 无边框窗口 · 本地优先
 ### 下载与启动
 | 形式 | 适合 | 说明 |
 | --- | --- | --- |
-| **Windows 安装包** `Score-Studio_0.3.7_x64-setup.exe` | 想放开始菜单 / 卸载列表 | 自动写入开始菜单 / 卸载项 |
+| **Windows 安装包** `Score-Studio_0.3.10_x64-setup.exe` | 想放开始菜单 / 卸载列表 | 自动写入开始菜单 / 卸载项 |
 | **便携 zip** `Score-Studio-Portable_x64.zip` | 绿色便携、拷 U 盘 | 解压后直接双击 `score-studio.exe`，不写注册表 |
 
 1. 去 [Releases](https://github.com/LinnnnYue/score-studio/releases) 下载最新版本

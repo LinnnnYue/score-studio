@@ -2052,6 +2052,83 @@ def _pulu_page_svg(url: str, out_json: str, wait: int = 15) -> bool:
         _sh.rmtree(profile, ignore_errors=True)
 
 
+def _pulu_page_musicxml(url: str, wait: int = 25) -> str:
+    """从页面内存取**解密后的原始 MusicXML**（酷狗 KQPU 时代的主数据源）。
+
+    页面把 KQPU 的解密结果挂在 `window.__musicXmlPrintContext.xmlSource`，
+    含完整调号、临时升降记号、精确时值与歌词。从 SVG 像素反解必然丢失
+    这些信息（实测丢 32% 音符 + 全部变化音），故只要该对象存在就优先用它；
+    取不到才由调用方降级到自适应反解。
+    """
+    import urllib.request as _ur
+    import shutil as _sh
+    edge = _pulu_find_edge()
+    if not edge:
+        return ''
+    port = 52500 + (os.getpid() % 400)
+    profile = tempfile.mkdtemp(prefix="pulu_xml_")
+    child = None
+    ws = None
+    js = ("(function(){try{var c=window.__musicXmlPrintContext;"
+          "var s=c&&c.xmlSource;"
+          "if(typeof s==='string'&&s.indexOf('<score-partwise')>=0)return s;"
+          "}catch(e){}return '';})()")
+    try:
+        args = [edge, '--headless=new', '--disable-gpu', '--no-sandbox',
+                '--disable-dev-shm-usage', '--no-proxy-server', '--no-first-run',
+                '--no-default-browser-check', '--remote-allow-origins=*',
+                f'--user-agent={_PSV_MOBILE_UA}', '--window-size=900,1600',
+                f'--remote-debugging-port={port}',
+                f'--user-data-dir={profile}', url]
+        print("[pulu] 读取页面原始谱面数据（无头 Edge）…")
+        child = subprocess.Popen(args, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+        target = None
+        for _ in range(60):
+            time.sleep(0.5)
+            try:
+                with _ur.urlopen(f'http://127.0.0.1:{port}/json/list', timeout=2) as r:
+                    lst = json.loads(r.read().decode('utf-8', 'ignore'))
+            except Exception:
+                continue
+            pages = [t for t in lst if t.get('type') == 'page'
+                     and t.get('webSocketDebuggerUrl')]
+            if pages:
+                target = pages[0]
+                break
+        if not target:
+            return ''
+        ws = _CdpWs(target['webSocketDebuggerUrl'], timeout=90)
+        ws.call('Page.enable')
+        for _ in range(max(1, wait)):
+            time.sleep(1)
+            try:
+                res = ws.call('Runtime.evaluate',
+                              {'expression': js, 'returnByValue': True})
+                xml = (res.get('result') or {}).get('value') or ''
+            except Exception:
+                xml = ''
+            if xml and '<score-partwise' in xml[:400]:
+                return xml
+        return ''
+    except Exception as e:
+        print(f"[pulu] 页面谱面数据读取失败：{str(e)[:120]}")
+        return ''
+    finally:
+        if ws:
+            ws.close()
+        if child:
+            try:
+                child.terminate()
+                child.wait(timeout=6)
+            except Exception:
+                try:
+                    child.kill()
+                except Exception:
+                    pass
+        _sh.rmtree(profile, ignore_errors=True)
+
+
 def _pulu_piano_path(input_str: str, output_dir: str, custom: str = "") -> str:
     """弹唱谱（数据层无旋律）→ 反解页面钢琴谱 → 单行小提琴版 PDF。"""
     opern_id = _pulu_parse_opernid(input_str)
@@ -2615,13 +2692,19 @@ def process_pulu(input_str: str, output_dir: str, custom: str = "") -> str:
         # 酷狗自 2026-11 起把直链内容从 MusicXML 换成私有加密格式（魔数 KQPU），
         # 接口字段名没变，内容却不再可解析 → 退到「页面所见即所得」通道。
         if raw_bytes[:4] == b'KQPU':
-            print("[pulu] 酷狗已改用私有加密格式（KQPU），直链无法排版 → 改走自适应反解")
-            _url = re.sub(r'(?<=[?&])sheetType=\d+', 'sheetType=3', input_str)
+            print("[pulu] 直链为加密格式（KQPU）→ 改从页面读取解密后的原始 MusicXML")
+            _url = re.sub(r'(?<=[?&])sheetType=\d+', 'sheetType=3',
+                          extract_url(input_str))
             if 'sheetType=' not in _url:
                 _url += ('&' if '?' in _url else '?') + 'sheetType=3'
-            return _pulu_auto_pdf(_url, output_dir, custom or song, singer)
+            raw = _pulu_page_musicxml(_url)
+            if not raw:
+                print("[pulu] 页面未给出原始谱面数据 → 降级为自适应反解")
+                return _pulu_auto_pdf(_url, output_dir, custom or song, singer)
+            print(f"[pulu] 原始谱面取回：{len(raw)} 字节（调号 / 升降号 / 时值完整）")
+        else:
+            raw = raw_bytes.decode('utf-8', 'ignore')
 
-        raw = raw_bytes.decode('utf-8', 'ignore')
         if '<score-partwise' not in raw and '<score-timewise' not in raw:
             raise ValueError("下载到的内容不是 MusicXML（酷狗直链有时效，可能已过期，请重试）")
 
