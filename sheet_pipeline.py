@@ -2025,21 +2025,17 @@ def _pulu_page_svg(url: str, out_json: str, wait: int = 15) -> bool:
         if not isinstance(data, list):
             raise ValueError("页面未返回图元数据（页面可能未渲染完成）。")
 
-        canvas = [s for s in data if (s.get('cls') or '') == 'page_canvas']
-        heads = 0
-        for c in canvas:
-            heads += sum(1 for i in c.get('items', [])
-                         if i.get('g') == 'path' and 6 <= i.get('w', 0) <= 8
-                         and 4 <= i.get('h', 0) <= 6)
+        # 页面改版后 svg 的 class 会变、符头尺寸会变 —— **不要再写死这两者**。
+        # 只判「存在图元足够多的 svg」，符头识别交给 _psv_auto_parse 自适应处理。
+        big = max(data, key=lambda s: s.get('n', 0)) if data else None
         for s in data:
-            if (s.get('cls') or '') == 'page_canvas' or s.get('n', 0) > 50:
+            if s.get('n', 0) > 50:
                 print(f"  svg#{s.get('svg')} cls={s.get('cls')!r} "
                       f"{s.get('cw')}x{s.get('ch')} 图元={s.get('n')}")
         with open(out_json, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False)
-        print(f"  符头数 = {heads}")
-        if not canvas or heads == 0:
-            raise ValueError("页面里没有符头 —— 该曲可能只有和弦谱，没有钢琴谱视图。")
+        if not big or big.get('n', 0) < 200:
+            raise ValueError("页面里没有可用的谱面图元（页面可能未渲染完成）。")
         return True
     finally:
         if ws:
@@ -2140,6 +2136,247 @@ def _pulu_piano_path(input_str: str, output_dir: str, custom: str = "") -> str:
         if cn == 0:
             raise ValueError("自检未通过：PDF 中未检出任何中文（中文字体渲染失败）")
         print(f"✅ PDF 已生成：{out}（{os.path.getsize(out)} 字节 · 酷狗钢琴谱反解 小提琴单行版）")
+        return out
+    finally:
+        try:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def _psv_auto_parse(raw_path: str) -> dict:
+    """酷狗新版页面 SVG → 结构化谱面（**自适应几何，不写死常数**）。
+
+    页面从 2026-11 起改了布局（svg class 变空、符头 13×11、行高 270、
+    viewBox 1460×5900）。写死常数必然随下次改版再崩，故本函数**现场量取**：
+      ① 水平细长图元 → 谱表线 → 每 5 条组成谱表 → 两两配成行
+      ② 每行高音谱表线的 x 段起点 → 小节边界
+      ③ path 尺寸众数 → 符头 → 按最近谱表算音级、按 x 算小节/格位
+      ④ text 图元 → 速度 / 和弦 / 歌词（歌词落在两谱表之间）
+    """
+    from collections import defaultdict as _dd
+
+    def _cluster(vals, tol):
+        vals = sorted(vals)
+        groups = []
+        for v in vals:
+            if groups and v - groups[-1][-1] <= tol:
+                groups[-1].append(v)
+            else:
+                groups.append([v])
+        return [sum(g) / len(g) for g in groups]
+
+    raw = json.load(open(raw_path, encoding='utf-8'))
+    svg = max(raw, key=lambda s: s.get('n', 0))
+    items = svg['items']
+
+    # ① 谱表线与行结构
+    hlines = [i for i in items if i['g'] in ('rect', 'path')
+              and i['w'] > 100 and i['h'] < 3]
+    ys = _cluster([i['y'] for i in hlines], tol=3)
+    diffs = [b - a for a, b in zip(ys, ys[1:]) if 3 < b - a < 30]
+    gap = sorted(diffs)[len(diffs) // 2] if diffs else 10.0
+    step = gap / 2.0
+
+    staves, i = [], 0
+    while i < len(ys):
+        grp = ys[i:i + 5]
+        if len(grp) == 5 and all(abs((grp[j + 1] - grp[j]) - gap) < 2 for j in range(4)):
+            staves.append({'top': grp[0], 'bottom': grp[-1],
+                           'center': (grp[0] + grp[-1]) / 2})
+            i += 5
+        else:
+            i += 1
+
+    rows, j = [], 0
+    while j + 1 < len(staves):
+        hi, lo = staves[j], staves[j + 1]
+        if lo['top'] - hi['bottom'] > gap * 3:
+            rows.append({'hi': hi, 'lo': lo})
+            j += 2
+        else:
+            j += 1
+    if not rows:
+        raise ValueError("页面里未识别到五线谱表（布局可能又变了）")
+
+    for r in rows:
+        top = r['hi']['top']
+        seg = [i for i in hlines if abs(i['y'] - top) < 3]
+        r['mx'] = _cluster([i['x'] for i in seg], tol=5)
+        r['nmeas'] = max(0, len(r['mx']))
+    prefix = [0]
+    for r in rows:
+        prefix.append(prefix[-1] + r['nmeas'])
+
+    # ② 符头（尺寸自适应：取出现最多的两类 path 尺寸）
+    cand = _dd(int)
+    for it in items:
+        if it['g'] == 'path' and 5 <= it['w'] <= 30 and 4 <= it['h'] <= 25:
+            cand[(round(it['w']), round(it['h']))] += 1
+    top_sizes = [k for k, _ in sorted(cand.items(), key=lambda kv: -kv[1])[:2]]
+    heads = [it for it in items if it['g'] == 'path'
+             and (round(it['w']), round(it['h'])) in top_sizes]
+    if len(heads) < 20:
+        raise ValueError(f"识别到的符头过少（{len(heads)} 个），页面可能未渲染完成")
+
+    HIGH_D0, LOW_D0, GRID = 30, 18, 8        # E4 / G2 / 每小节 8 个八分格
+    measures = _dd(lambda: {'high': _dd(list), 'low': _dd(list)})
+    for h in heads:
+        xc, yc = h['x'] + h['w'] / 2, h['y'] + h['h'] / 2
+        best = None
+        for ri, r in enumerate(rows):
+            for sn, st in (('high', r['hi']), ('low', r['lo'])):
+                d = abs(yc - st['center'])
+                if best is None or d < best[0]:
+                    best = (d, ri, r, sn, st)
+        if best is None or best[0] > gap * 8:
+            continue
+        _d, ri, r, sn, st = best
+        mx = r['mx']
+        if len(mx) < 2:
+            continue
+        mi = 0
+        for k in range(len(mx) - 1):
+            if xc >= mx[k] - 8:
+                mi = k
+        if xc < mx[0] - 20:
+            continue
+        x0 = mx[mi]
+        w = (mx[mi + 1] - x0) if mi + 1 < len(mx) else float(gap * 15.6)
+        grid = max(0, min(GRID - 1, int(round((xc - x0) / (w / GRID) - 0.5))))
+        d0 = HIGH_D0 if sn == 'high' else LOW_D0
+        dia = int(round(d0 + (st['bottom'] - yc) / step))
+        measures[prefix[ri] + mi][sn][grid].append(dia)
+
+    # ③ 文字：速度 / 和弦 / 歌词
+    texts = [i for i in items if i['g'] == 'text' and i.get('t')]
+    lyrics = _dd(lambda: _dd(list))
+    chords = _dd(dict)
+    bpm, sharps = 100, set()
+    for ri, r in enumerate(rows):
+        y_lo = r['hi']['bottom'] + step * 2
+        y_hi = r['lo']['top'] - step * 2
+        mx = r['mx']
+        for t in texts:
+            ty, tx, s = t['y'], t['x'] + t['w'] / 2, (t['t'] or '').strip()
+            if not s:
+                continue
+            m = re.match(r'^=\s*(\d+)', s)
+            if m:
+                bpm = int(m.group(1))
+                continue
+            if r['hi']['top'] - gap * 6 < ty < r['hi']['top'] - gap:
+                if re.match(r'^[A-G][#b]?', s):
+                    mi = max(0, sum(1 for x in mx if x <= tx) - 1)
+                    chords[prefix[ri] + mi][tx] = s
+                    for c in re.findall(r'([A-G])#', s):
+                        sharps.add(c)
+                continue
+            if y_lo <= ty <= y_hi and not re.fullmatch(r'\d+', s) \
+                    and not re.match(r'^[A-G][#b]?', s) and len(s) <= 12:
+                mi = max(0, sum(1 for x in mx if x <= tx) - 1)
+                x0 = mx[mi] if mi < len(mx) else mx[0]
+                w = (mx[mi + 1] - x0) if mi + 1 < len(mx) else float(gap * 15.6)
+                grid = max(0, min(GRID - 1, int(round((tx - x0) / (w / GRID) - 0.5))))
+                lyrics[prefix[ri] + mi][grid].append(s)
+
+    # 调号：升号顺序 F C G D A E B，取和弦里出现过的最高位
+    fifths = 0
+    for k, c in enumerate('FCGDAEB', 1):
+        if c in sharps:
+            fifths = k
+
+    return {'measures': dict(measures), 'lyrics': dict(lyrics),
+            'chords': {k: [v[x] for x in sorted(v)] for k, v in chords.items()},
+            'bpm': bpm, 'fifths': fifths, 'rows': len(rows),
+            'staves': len(staves), 'heads': len(heads), 'gap': gap,
+            'nmeas': prefix[-1]}
+
+
+def _psv_auto_musicxml(d: dict, title: str) -> tuple:
+    """自适应反解结果 → **只留第一行（高音谱表）**的 MusicXML。"""
+    global _PSV_ACC
+    _PSV_ACC = _psv_acc_map(d['fifths'])
+    nmeas = d['nmeas']
+    out = ['<?xml version="1.0" encoding="UTF-8"?>',
+           '<!DOCTYPE score-partwise PUBLIC "-//Recordare//DTD MusicXML 4.0 Partwise//EN" '
+           '"http://www.musicxml.org/dtds/partwise.dtd">',
+           '<score-partwise version="4.0">',
+           f'  <work><work-title>{_psv_esc(title)}</work-title></work>',
+           '  <identification><creator type="composer">Pulu</creator></identification>',
+           '  <part-list><score-part id="P1"><part-name>Violin</part-name>',
+           '    <score-instrument id="P1-I1"><instrument-name>Violin</instrument-name>'
+           '</score-instrument>',
+           '    <midi-instrument id="P1-I1"><midi-channel>1</midi-channel>'
+           '<midi-program>41</midi-program></midi-instrument>',
+           '  </score-part></part-list>', '  <part id="P1">']
+
+    warns = []
+    for m in range(nmeas):
+        hi = dict((d['measures'].get(m) or {}).get('high') or {})
+        words = {g: ' '.join(ws) for g, ws in
+                 (d['lyrics'].get(m) or {}).items() if ws}
+        out.append(f'    <measure number="{m + 1}">')
+        if m == 0:
+            out.append('      <attributes>')
+            out.append(f'        <divisions>{PSV_DIV}</divisions>')
+            out.append(f'        <key><fifths>{d["fifths"]}</fifths></key>')
+            out.append('        <time><beats>4</beats><beat-type>4</beat-type></time>')
+            out.append('        <staves>1</staves>')
+            out.append('        <clef number="1"><sign>G</sign><line>2</line></clef>')
+            out.append('      </attributes>')
+            out.append('      <direction placement="above"><direction-type><metronome>'
+                       f'<beat-unit>quarter</beat-unit><per-minute>{d["bpm"]}</per-minute>'
+                       '</metronome></direction-type>'
+                       f'<sound tempo="{d["bpm"]}"/></direction>')
+        vl, t1 = _psv_gen_voice(hi, 1, 1, words)
+        out += vl
+        if t1 != 4 * PSV_DIV:
+            warns.append(f'{m + 1}:{t1}')
+        out.append('    </measure>')
+    out.append('  </part>')
+    out.append('</score-partwise>')
+    xml = '\n'.join(out)
+    return xml, {'measures': nmeas, 'notes': len(re.findall(r'<note[ >]', xml)),
+                 'lyrics': len(re.findall(r'<lyric', xml)),
+                 'warnings': warns, 'fifths': d['fifths'], 'bpm': d['bpm'],
+                 'heads': d['heads'], 'rows': d['rows']}
+
+
+def _pulu_auto_pdf(url: str, output_dir: str, title: str, singer: str) -> str:
+    """新版页面 → 自适应反解 → 单行小提琴版矢量 PDF（KQPU 直链时代的主通道）。"""
+    tmpdir = tempfile.mkdtemp(prefix="pulu_auto_")
+    try:
+        probe = os.path.join(tmpdir, "probe.json")
+        _pulu_page_svg(url, probe, wait=15)
+        d = _psv_auto_parse(probe)
+        print(f"[pulu] 自适应标定：{d['rows']} 行 / {d['staves']} 谱表 / "
+              f"{d['heads']} 符头 / 五线间距 {d['gap']:.0f}")
+        xml, st = _psv_auto_musicxml(d, title)
+        print(f"[pulu] 单行谱：{st['measures']} 小节 · 音符 {st['notes']} · "
+              f"歌词 {st['lyrics']} · 调号 {st['fifths']} · BPM {st['bpm']} · "
+              f"时值异常 {len(st['warnings'])}")
+        if st['notes'] < 20:
+            raise ValueError("反解出的音符过少，页面可能未渲染完成。")
+
+        xml_tmp = os.path.join(tmpdir, "score.musicxml")
+        with open(xml_tmp, 'w', encoding='utf-8', newline='') as f:
+            f.write(xml)
+        ms = find_musescore()
+        if not ms:
+            raise ValueError(
+                "未找到 MuseScore（曲谱排版引擎，免费开源）。\n"
+                "请先安装 MuseScore 4：https://musescore.org/zh-hans/download")
+        stem = f"{title}-{singer}" if singer else title
+        os.makedirs(output_dir, exist_ok=True)
+        out = os.path.join(output_dir, safe_name(f"{stem}-小提琴") + ".pdf")
+        if not mxl2pdf(ms, xml_tmp, out):
+            raise ValueError("MuseScore 排版失败（未产出 PDF），请重试。")
+        cn = _pdf_cjk_count(out)
+        if cn == 0:
+            print("[pulu] ⚠ PDF 未检出中文（该曲可能无中文歌词）")
+        print(f"✅ PDF 已生成：{out}（{os.path.getsize(out)} 字节 · 单行小提琴版）")
         return out
     finally:
         try:
@@ -2378,17 +2615,11 @@ def process_pulu(input_str: str, output_dir: str, custom: str = "") -> str:
         # 酷狗自 2026-11 起把直链内容从 MusicXML 换成私有加密格式（魔数 KQPU），
         # 接口字段名没变，内容却不再可解析 → 退到「页面所见即所得」通道。
         if raw_bytes[:4] == b'KQPU':
-            print("[pulu] 酷狗已改用私有加密格式（KQPU），直链无法排版 → 改走页面渲染")
+            print("[pulu] 酷狗已改用私有加密格式（KQPU），直链无法排版 → 改走自适应反解")
             _url = re.sub(r'(?<=[?&])sheetType=\d+', 'sheetType=3', input_str)
             if 'sheetType=' not in _url:
                 _url += ('&' if '?' in _url else '?') + 'sheetType=3'
-            stem = f"{song}-{singer}" if singer else song
-            os.makedirs(output_dir, exist_ok=True)
-            out = os.path.join(output_dir, safe_name(f"{stem}-小提琴") + ".pdf")
-            if not _pulu_page_render_pdf(_url, out):
-                raise ValueError("页面渲染未能产出 PDF，请重试。")
-            print(f"✅ PDF 已生成：{out}（{os.path.getsize(out)} 字节 · 酷狗页面渲染版）")
-            return out
+            return _pulu_auto_pdf(_url, output_dir, custom or song, singer)
 
         raw = raw_bytes.decode('utf-8', 'ignore')
         if '<score-partwise' not in raw and '<score-timewise' not in raw:
