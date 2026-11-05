@@ -2149,6 +2149,129 @@ def _pulu_piano_path(input_str: str, output_dir: str, custom: str = "") -> str:
             pass
 
 
+def _pulu_long_image_to_pages(img, target_w: int = None):
+    """长图 → 按 A4 比例切成多页（每页缩放到标准宽）。末页不足则补白底。"""
+    from PIL import Image as _I
+    tw = target_w or TARGET_WIDTH
+    a4_ratio = 3508.0 / 2480.0                  # A4 高/宽
+    seg_h = int(img.width * a4_ratio)
+    pages, y = [], 0
+    while y < img.height:
+        seg = img.crop((0, y, img.width, min(y + seg_h, img.height)))
+        if seg.height < seg_h:
+            canvas = _I.new("RGB", (img.width, seg_h), (255, 255, 255))
+            canvas.paste(seg.convert("RGB"), (0, 0))
+            seg = canvas
+        pages.append(resize_standard(seg.convert("RGB")))
+        y += seg_h
+    return pages
+
+
+def _pulu_page_render_pdf(url: str, out_pdf: str, wait: int = 15) -> bool:
+    """兜底通道：用系统 Edge 打开页面，按谱面区域高清截图 → 切页 → PDF。
+
+    为什么需要它：酷狗自 2026-11 起把 `opern_level_file` 从 MusicXML 换成了
+    私有加密格式（魔数 `KQPU`），直链已无法直接排版。而页面本身仍能正常
+    渲染出五线谱，故退一步「所见即所得」——把看到的谱面原样取下来。
+    """
+    import shutil as _sh
+    import urllib.request as _ur
+    edge = _pulu_find_edge()
+    if not edge:
+        raise ValueError("未找到 Microsoft Edge（Win10+ 系统自带）。")
+
+    port = 53400 + (os.getpid() % 400)
+    profile = tempfile.mkdtemp(prefix="pulu_shot_")
+    child = ws = None
+    try:
+        child = subprocess.Popen([
+            edge, '--headless=new', '--disable-gpu', '--no-sandbox',
+            '--disable-dev-shm-usage', '--no-proxy-server',
+            '--no-first-run', '--no-default-browser-check',
+            '--remote-allow-origins=*',
+            f'--user-agent={_PSV_MOBILE_UA}',
+            '--window-size=900,1600',
+            f'--remote-debugging-port={port}',
+            f'--user-data-dir={profile}',
+            url,
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        print("[pulu] 渲染谱面页面（无头 Edge，约 30~60 秒）…")
+        target = None
+        for _ in range(60):
+            time.sleep(0.5)
+            try:
+                with _ur.urlopen(f'http://127.0.0.1:{port}/json/list', timeout=2) as r:
+                    lst = json.loads(r.read().decode('utf-8', 'ignore'))
+            except Exception:
+                continue
+            pages = [t for t in lst if t.get('type') == 'page'
+                     and t.get('webSocketDebuggerUrl')]
+            if pages:
+                target = pages[0]
+                break
+        if not target:
+            raise ValueError("Edge 调试端口未就绪。")
+
+        ws = _CdpWs(target['webSocketDebuggerUrl'], timeout=180)
+        ws.call('Page.enable')
+        time.sleep(max(1, wait))
+        ws.call('Runtime.evaluate',
+                {'expression': 'window.scrollTo(0, document.body.scrollHeight)'})
+        time.sleep(8)
+        ws.call('Runtime.evaluate', {'expression': 'window.scrollTo(0, 0)'})
+        time.sleep(3)
+
+        # 取「面积最大的 svg」= 谱面本体（各版本 class 名不同，不能写死）
+        js = """(() => {
+          let best=null, area=0;
+          document.querySelectorAll('svg').forEach(s=>{
+            const r=s.getBoundingClientRect();
+            if (r.width*r.height > area) { area=r.width*r.height; best=r; }
+          });
+          if (!best) return 'null';
+          return JSON.stringify({x:best.x+window.scrollX, y:best.y+window.scrollY,
+                                 w:best.width, h:best.height});
+        })()"""
+        m = ws.call('Runtime.evaluate', {'expression': js, 'returnByValue': True})
+        box = json.loads(m['result']['value'])
+        if box['w'] < 200 or box['h'] < 200:
+            raise ValueError("页面里没找到谱面区域（页面可能未渲染完成）。")
+        print(f"[pulu] 谱面区域 {box['w']:.0f}×{box['h']:.0f}，截取中…")
+
+        shot = ws.call('Page.captureScreenshot', {
+            'format': 'png', 'captureBeyondViewport': True,
+            'clip': {'x': box['x'], 'y': box['y'],
+                     'width': box['w'], 'height': box['h'], 'scale': 3}})
+        data = _b64.b64decode(shot.get('data') or '')
+        if len(data) < 5000:
+            raise ValueError("截图为空（页面可能未渲染完成）。")
+
+        tmp_png = os.path.join(profile, "score.png")
+        with open(tmp_png, 'wb') as f:
+            f.write(data)
+        from PIL import Image as _I
+        img = _I.open(tmp_png).convert("RGB")
+        print(f"[pulu] 截图 {img.width}×{img.height}，切页…")
+        pages = _pulu_long_image_to_pages(img)
+        print(f"[pulu] 共 {len(pages)} 页")
+        to_pdf(pages, out_pdf)
+        return os.path.isfile(out_pdf) and os.path.getsize(out_pdf) > 0
+    finally:
+        if ws:
+            ws.close()
+        if child:
+            try:
+                child.terminate()
+                child.wait(timeout=6)
+            except Exception:
+                try:
+                    child.kill()
+                except Exception:
+                    pass
+        _sh.rmtree(profile, ignore_errors=True)
+
+
 def _pulu_probe_versions(opern_id: str) -> tuple:
     """同曲其他曲谱版本探测 → (opern_id, js) 或 ("", None)。
 
@@ -2251,7 +2374,23 @@ def process_pulu(input_str: str, output_dir: str, custom: str = "") -> str:
 
     tmpdir = tempfile.mkdtemp(prefix="pulu_")
     try:
-        raw = _pulu_download(levels[key]).decode('utf-8', 'ignore')
+        raw_bytes = _pulu_download(levels[key])
+        # 酷狗自 2026-11 起把直链内容从 MusicXML 换成私有加密格式（魔数 KQPU），
+        # 接口字段名没变，内容却不再可解析 → 退到「页面所见即所得」通道。
+        if raw_bytes[:4] == b'KQPU':
+            print("[pulu] 酷狗已改用私有加密格式（KQPU），直链无法排版 → 改走页面渲染")
+            _url = re.sub(r'(?<=[?&])sheetType=\d+', 'sheetType=3', input_str)
+            if 'sheetType=' not in _url:
+                _url += ('&' if '?' in _url else '?') + 'sheetType=3'
+            stem = f"{song}-{singer}" if singer else song
+            os.makedirs(output_dir, exist_ok=True)
+            out = os.path.join(output_dir, safe_name(f"{stem}-小提琴") + ".pdf")
+            if not _pulu_page_render_pdf(_url, out):
+                raise ValueError("页面渲染未能产出 PDF，请重试。")
+            print(f"✅ PDF 已生成：{out}（{os.path.getsize(out)} 字节 · 酷狗页面渲染版）")
+            return out
+
+        raw = raw_bytes.decode('utf-8', 'ignore')
         if '<score-partwise' not in raw and '<score-timewise' not in raw:
             raise ValueError("下载到的内容不是 MusicXML（酷狗直链有时效，可能已过期，请重试）")
 
