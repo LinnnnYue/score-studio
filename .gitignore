@@ -33,3 +33,14 @@ _selftest_out/
 # 测试产物
 _ocr_test/
 _selftest_out/
+
+# 探针/试跑产物（本地取证用，不入库）
+_probe_out/
+_test_out/
+_probe_*.py
+
+# 本地样张与调试残留
+_samples/
+debug_*.png
+debug_*.html
+_ui_shot.png

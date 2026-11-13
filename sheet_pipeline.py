@@ -1225,6 +1225,23 @@ PULU_UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) "
 PULU_LEVEL = {'0': 'Easy', '2': 'Medium', '1': 'Easy', '3': 'Hard'}
 PULU_WANT_LEVEL = '2'          # 主上钦定：只要 Medium 档（无此档时自动降级并回报）
 
+# ── 谱种（设置里「默认输出什么谱」）────────────────────────────────────
+# 实测（2026-11-13 · 卢广仲《我爱你》32157189 全枚举）：
+#   _1_0  弹唱谱 / AI弹唱谱 / 六线谱·和弦谱  → 数据只有和弦 + 逐字歌词，noteArray 全空
+#   _5_0  AI独奏谱 / 五线谱                → 完整 MusicXML（调号 · 升降号 · 歌词）
+#   _7_*  AI功能谱 / 级数谱                → 完整 MusicXML（functional 版，整体低八度）
+# 小提琴与钢琴同源于 _5_（裁 / 不裁声部）；简谱源自 _7_；吉他/尤克里里同源于 _1_
+#（酷狗侧没有独立的尤克里里资源——四线谱只是前端把同一份和弦数据换了个画法）。
+PULU_SHEET_KINDS = {
+    'violin':  {'label': '小提琴单行',   'inst': '5', 'mode': 'staff', 'suffix': '小提琴'},
+    'piano':   {'label': '钢琴大谱表',   'inst': '5', 'mode': 'staff', 'suffix': '钢琴'},
+    'jianpu':  {'label': '简谱功能谱',   'inst': '7', 'mode': 'staff', 'suffix': '简谱'},
+    'guitar':  {'label': '吉他和弦谱',   'inst': '1', 'mode': 'chord', 'suffix': '吉他'},
+    'ukulele': {'label': '尤克里里和弦谱', 'inst': '1', 'mode': 'chord', 'suffix': '尤克里里'},
+}
+PULU_WANT_SHEET = 'violin'     # 默认：小提琴单行（主上自己的用途）；前端设置可覆盖
+
+
 # 根元素上的前端渲染提示属性（OSMD 用）。非标准，不删 → MuseScore 解析器段错误 rc=139。
 _PULU_OSMD_ATTR = re.compile(r'\s+osmdScoreType="[^"]*"')
 # AI 误识别的「花体踏板」噪声：整块 <direction> 内出现 <pedal> 即删（真人不会 6 层踏板同踩）
@@ -1323,6 +1340,298 @@ def _pulu_keep_first_part(x: str):
     return x, len(ids) - 1
 
 
+def _pulu_sheet_kind(kind: str) -> dict:
+    """谱种键 → 配置。非法键一律回落默认（绝不让 UI 的脏值把流水线打崩）。"""
+    return PULU_SHEET_KINDS.get((kind or '').strip(), PULU_SHEET_KINDS[PULU_WANT_SHEET])
+
+
+def _pulu_resolve_opern(input_str: str, kind: str):
+    """按目标谱种取到对应的 opern 资源 → (opern_id, js, data, info)。
+
+    酷狗侧一个 opern 只承载一种谱面，故「要什么谱」= 「要哪个资源」：
+      · 分享链接自带的 opernid 已是目标乐器 → 直接用（最省时，且用户所见即所得）
+      · 否则以曲目 ID 枚举同曲资源（实测可推断的只有 _1_0 弹唱谱 / _5_0 独奏谱）
+      · 简谱 _7_* 的第三段是外部资源号（如 330060），无法由 song_id 推断，
+        只能由分享链接带入 —— 推断不到时明确告知，不静默降级。
+    """
+    cfg = _pulu_sheet_kind(kind)
+    want_inst = cfg['inst']
+    cur = _pulu_parse_opernid(input_str)
+    cur_inst = cur.split('_')[1] if cur and cur.count('_') >= 2 else ''
+
+    if cur and cur_inst == want_inst:
+        try:
+            js = _pulu_fetch(cur, cur_inst)
+            data = js.get('data') or {}
+            info = data.get('opern_info') or {}
+            if info:
+                return cur, js, data, info
+        except Exception as e:
+            print(f"[pulu] 直取 {cur} 失败：{str(e)[:80]}")
+
+    song_id = (cur or '').split('_')[0]
+    if song_id.isdigit():
+        print(f"[pulu] 目标谱种「{cfg['label']}」→ 枚举同曲资源 {song_id}_{want_inst}_*")
+        for b in ('0', '1', '2'):
+            oid = f"{song_id}_{want_inst}_{b}"
+            if oid == cur:
+                continue
+            try:
+                js = _pulu_fetch(oid, want_inst, timeout=8)
+            except Exception:
+                continue
+            data = js.get('data') or {}
+            info = data.get('opern_info') or {}
+            if info:
+                print(f"[pulu] ✓ 命中 {oid}（{info.get('opern_name') or '-'}）")
+                return oid, js, data, info
+
+    # 唯一例外：目标就是简谱，而用户贴的链接恰好就是简谱资源
+    if cur and cur_inst == want_inst:
+        raise ValueError(f"该曲在酷狗侧没有「{cfg['label']}」资源。")
+    raise ValueError(
+        f"该曲在酷狗侧没有「{cfg['label']}」资源。\n"
+        f"（目标乐器号 _ {want_inst} _，已枚举 {song_id}_1..8_0..2）\n"
+        "提示：简谱（级数功能谱）的资源号无法从曲目推断，需直接粘贴简谱分享链接。")
+
+
+# 时值 → MusicXML <type>（divisions 固定 4，即每四分音符 4 份）
+_DUR_TYPE = {16: 'whole', 12: 'half', 8: 'half', 6: 'quarter', 4: 'quarter',
+             3: 'eighth', 2: 'eighth', 1: '16th'}
+
+
+def _dur_type(d: int) -> str:
+    """时长（单位）→ MusicXML <type>。非标准时值取最接近的显示类型；
+    duration 才是权威值，MuseScore 按它排版，type 只影响符头外观。"""
+    d = max(1, int(d))
+    if d in _DUR_TYPE:
+        return _DUR_TYPE[d]
+    near = min(_DUR_TYPE, key=lambda k: (abs(k - d), -k))
+    return _DUR_TYPE[near]
+
+
+def _pulu_chord_musicxml(songobj: dict, title: str) -> tuple:
+    """弹唱谱 beatArray → 和弦节奏谱 MusicXML（slash 记谱 + 和弦记号 + 逐字歌词）。
+
+    为什么不是六线谱：酷狗该谱源的 beatArray 里 noteArray 全为空 ——
+    没有弦号、没有品格号，页面上那幅六线谱是前端按和弦名自行推演的。
+    若强行反解像素去「还原」六线谱，得到的是猜测而非原始指法。
+    故这里排的是业界标准的 lead sheet（节奏斜线 + 和弦 + 歌词），信息真实可依。
+
+    时长口径：歌词条的 `length` 以 `partnotePerBeat` 为单位（通常 4 = 每拍 4 份），
+    跨拍的同一个字会被拆成多条（前条 endTime == 后条 startTime）。
+    故这里**不按「每拍均分」拍脑袋切时值**，而是把每个字按 startTime 投影到
+    小节内单位格、按 length 占位 —— 时值才与演唱一致，小节也不会残缺。
+    """
+    ba = songobj.get('beatArray') or []
+    if not ba:
+        return '', {}
+    bps = int(songobj.get('beatPerSection') or 4)
+    if bps not in (2, 3, 4, 6, 8):
+        bps = 4
+    fifths = _psv_tone_to_fifths(songobj.get('songTone') or songobj.get('songOriginalTone'))
+    bpm = float(songobj.get('songBPM') or 0)
+    capo = int(songobj.get('capoNum') or 0)
+    ppb = float(songobj.get('partnotePerBeat') or 4) or 4.0
+    div = 4                                     # 每四分音符 4 份 → 可表十六分
+    scale = div / ppb                           # 源单位 → 本谱单位
+    u_meas = bps * div                          # 每小节单位数
+    sec_unit = (60.0 / bpm / ppb) if bpm > 0 else 0.08
+
+    # 按小节（segment）归组；每小节起点取该段最小 startTime
+    seg_beats, seg_t0 = {}, {}
+    for b in ba:
+        s = int(b.get('segment') or 0)
+        seg_beats.setdefault(s, []).append(b)
+        t = b.get('startTime')
+        if isinstance(t, (int, float)):
+            seg_t0[s] = min(seg_t0.get(s, 1e9), float(t))
+
+    body = []
+    n_note = n_lyr = n_chord = 0
+    n_carry = 0
+    prev_chord = ''
+    carry = []                                  # 上小节溢出、顺接本小节的歌词 (字, 占位)
+    for si, s in enumerate(sorted(seg_beats)):
+        # ① 收集本小节歌词事件（含上小节顺接过来的，一律从本小节第 0 单位起排）
+        events = [(0, w, ln) for (w, ln) in carry]
+        carry = []
+        for b in sorted(seg_beats[s], key=lambda x: (x.get('beat') or 0,
+                                                     x.get('startTime') or 0)):
+            for ly in (b.get('lyricArray') or []):
+                w = (ly.get('word') or '').strip()
+                if not w:
+                    continue
+                t0 = seg_t0.get(s)
+                t = ly.get('startTime')
+                if isinstance(t, (int, float)) and t0 is not None:
+                    off = int(round((float(t) - t0) / sec_unit))
+                else:
+                    off = int(b.get('beat') or 0) * div
+                ln = max(1, int(round(float(ly.get('length') or 1) * scale)))
+                events.append((max(0, off), w, min(ln, u_meas)))
+        events.sort(key=lambda e: e[0])
+        # ② 和弦落点（相邻相同和弦只标一次，避免「Am7 Am7 Am7」刷屏）
+        chords = {}
+        for b in seg_beats[s]:
+            ch = (b.get('chord') or '').strip()
+            if not ch:
+                continue
+            chords.setdefault(min(int(b.get('beat') or 0) * div, u_meas - 1), ch)
+
+        out = [f'    <measure number="{si + 1}">']
+        if si == 0:
+            out.append('      <attributes>')
+            out.append(f'        <divisions>{div}</divisions>')
+            out.append(f'        <key><fifths>{fifths}</fifths></key>')
+            out.append(f'        <time><beats>{bps}</beats><beat-type>4</beat-type></time>')
+            out.append('        <clef><sign>G</sign><line>2</line></clef>')
+            out.append('      </attributes>')
+            if bpm > 0:
+                out.append('      <direction placement="above">'
+                           '<direction-type><metronome>'
+                           f'<beat-unit>quarter</beat-unit><per-minute>{int(round(bpm))}</per-minute>'
+                           '</metronome></direction-type>'
+                           f'<sound tempo="{int(round(bpm))}"/></direction>')
+
+        def emit_harmony(at: int):
+            """在指定单位位置输出和弦记号（同一和弦连续不重复标注）。"""
+            nonlocal n_chord, prev_chord
+            ch = chords.get(at)
+            if not ch or ch == prev_chord:
+                return
+            pc = _psv_parse_chord(ch)
+            if not pc:
+                return
+            step, alter, kind_name = pc
+            n_chord += 1
+            prev_chord = ch
+            out.append('      <harmony>'
+                       f'<root><root-step>{step}</root-step>' +
+                       (f'<root-alter>{alter}</root-alter>' if alter else '') +
+                       f'</root><kind text="{_psv_esc(ch)}">{kind_name}</kind></harmony>')
+
+        # ③ 逐事件铺谱：休止只填补空隙，绝不覆盖歌词，也绝不丢字
+        pos = 0
+        for off, w, ln in events:
+            if off < pos:
+                off = pos                       # 重叠则顺延，保字不丢
+            if off >= u_meas:
+                carry.append((w, ln))           # 本小节已满 → 顺接到下一小节
+                n_carry += 1
+                continue
+            if off > pos:
+                emit_harmony(pos)
+                run = off - pos
+                out.append(f'      <note><rest/><duration>{run}</duration>'
+                           f'<type>{_dur_type(run)}</type></note>')
+                pos = off
+            emit_harmony(pos)
+            ln = min(ln, u_meas - pos)
+            out.append('      <note>'
+                       '<pitch><step>B</step><octave>4</octave></pitch>'
+                       f'<duration>{ln}</duration><type>{_dur_type(ln)}</type>'
+                       '<notehead>slash</notehead>')
+            n_lyr += 1
+            out.append(f'<lyric number="1"><syllabic>single</syllabic>'
+                       f'<text>{_psv_esc(w)}</text></lyric>')
+            out.append('</note>')
+            n_note += 1
+            pos += ln
+        if pos < u_meas:
+            emit_harmony(pos)
+            out.append(f'      <note><rest/><duration>{u_meas - pos}</duration>'
+                       f'<type>{_dur_type(u_meas - pos)}</type></note>')
+        out.append('    </measure>')
+        body.append('\n'.join(out))
+
+    head = ['<?xml version="1.0" encoding="utf-8"?>',
+            '<!DOCTYPE score-partwise PUBLIC "-//Recordare//DTD MusicXML 4.0 Partwise//EN" '
+            '"http://www.musicxml.org/dtds/partwise.dtd">',
+            '<score-partwise version="4.0">',
+            '  <work><work-title>%s</work-title></work>' % _psv_esc(title),
+            '  <identification><encoding><software>Score Studio</software></encoding></identification>',
+            '  <part-list><score-part id="P1"><part-name>Chord</part-name></score-part></part-list>',
+            '  <part id="P1">']
+    tail = ['  </part>', '</score-partwise>']
+    xml = '\n'.join(head + body + tail) + '\n'
+    stat = {'measures': len(body), 'notes': n_note, 'lyrics': n_lyr,
+            'chords': n_chord, 'bps': bps, 'bpm': round(bpm, 1),
+            'fifths': fifths, 'capo': capo, 'carried': n_carry}
+    return xml, stat
+
+
+def _pulu_chord_path(input_str: str, output_dir: str, custom: str = '', kind: str = 'guitar') -> str:
+    """弹唱谱资源 → 和弦节奏谱 PDF（吉他和尤克里里共用同一份数据）。"""
+    cfg = _pulu_sheet_kind(kind)
+    opern_id, js, data, info = _pulu_resolve_opern(input_str, kind)
+    smart = data.get('smart_opern_info') or {}
+    song = (data.get('song_name') or '').strip() or (info.get('song_name') or '').strip() or '酷狗曲谱'
+    singer = (data.get('singer_name') or '').strip() or (info.get('singer_name') or '').strip()
+    print(f"[pulu] 曲名={song} · 歌手={singer or '-'} · 谱种={cfg['label']} · opern={opern_id}")
+
+    # 三个直链分别对应 基础 / 原调 / 简化 三份和弦数据；默认取 basis（谱面完整度最高）
+    url = ''
+    for k in ('basis_opern_file', 'forward_opern_file', 'simple_opern_file'):
+        url = (info.get(k) or smart.get(k) or '').strip()
+        if url:
+            print(f"[pulu] 和弦数据源：{k}")
+            break
+    if not url:
+        raise ValueError("接口未给出和弦谱数据直链（basis/forward/simple_opern_file 全空）。")
+
+    ms = find_musescore()
+    if not ms:
+        raise ValueError(
+            "未找到 MuseScore（曲谱排版引擎，免费开源）。\n"
+            "请在软件「设置 → 运行环境」里点「帮我装好」，或手动安装 MuseScore 4。")
+
+    tmpdir = tempfile.mkdtemp(prefix="pulu_chord_")
+    try:
+        raw = _pulu_download(url)
+        obj = json.loads(raw.decode('utf-8', 'ignore'))
+        sm = obj.get('sheetMusic') or []
+        if not sm:
+            raise ValueError("和弦谱数据为空（sheetMusic 缺失）。")
+        songobj = json.loads(sm[0]) if isinstance(sm[0], str) else sm[0]
+
+        raw_tone = songobj.get('songTone') or songobj.get('songOriginalTone') or '?'
+        xml, st = _pulu_chord_musicxml(songobj, custom or song)
+        if not xml:
+            raise ValueError("和弦谱数据无有效拍序列（beatArray 为空），无法排版。")
+        print(f"[pulu] 和弦谱：{st['measures']} 小节 · {st['bps']}/4 · BPM {st['bpm']} · "
+              f"调 {raw_tone}（fifths={st['fifths']}）· 和弦 {st['chords']} · 歌词 {st['lyrics']}"
+              + (f" · 变调夹 {st['capo']} 品" if st['capo'] else '')
+              + (f" · 跨小节顺接 {st['carried']}" if st['carried'] else ''))
+        if st['chords'] == 0:
+            raise ValueError("该谱未解析出任何和弦记号，可能不是弹唱谱资源。")
+
+        xml_tmp = os.path.join(tmpdir, "score.musicxml")
+        with open(xml_tmp, 'w', encoding='utf-8', newline='') as f:
+            f.write(xml)
+
+        stem = f"{song}-{singer}" if singer else song
+        os.makedirs(output_dir, exist_ok=True)
+        out = os.path.join(output_dir, safe_name(f"{stem}-{cfg['suffix']}") + ".pdf")
+        if not mxl2pdf(ms, xml_tmp, out):
+            raise ValueError("MuseScore 排版失败（未产出 PDF），请确认 MuseScore 可正常启动后重试。")
+
+        cn = _pdf_cjk_count(out)
+        print(f"[pulu] 自检：PDF 汉字={cn}")
+        if cn == 0 and st['lyrics'] > 0:
+            raise ValueError("自检未通过：PDF 中未检出中文（中文字体渲染失败）")
+        print(f"✅ PDF 已生成：{out}（{os.path.getsize(out)} 字节 · {cfg['label']}）")
+        return out
+    finally:
+        try:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+
+
 def find_musescore() -> str:
     """定位 MuseScore（矢量排版引擎）。环境变量 SCORE_MUSESCORE 可强制指定。"""
     exes = ("MuseScore4.exe", "MuseScore3.exe", "MuseScore.exe")
@@ -1388,74 +1697,102 @@ def mxl2pdf(ms: str, xml_path: str, pdf_path: str, timeout: int = 150) -> bool:
 
     用 Popen + 轮询而非 run(timeout)：某些环境下 MuseScore 转完**不自动退出**
     （弹窗/已有一实例），若等进程结束会白等到超时。产物落盘且大小稳定即算成功。
+
+    平台插件策略（2026-11-13 双机实测修正）：**默认平台优先，offscreen 兜底**。
+      · 本机 MuseScore 4 确实带 qoffscreen.dll，但 offscreen 下导出会 4 秒静默退出、
+        产物为空 —— 「插件在」不等于「能出 PDF」。
+      · 老公机器则相反：不带 offscreen，硬设该值会弹模态框把进程卡到超时。
+    故两档都试，先默认后 offscreen，任一产出即成功；全败才回报。
     """
-    env = dict(os.environ)
-    env.update(_qt_platform_env(ms))          # 平台插件按实际探测，别硬编码
-    env['QT_QPA_FONTDIR'] = os.path.join(     # 缺 → 中文歌词在 PDF 里渲染不出来
+    env_base = dict(os.environ)
+    env_base['QT_QPA_FONTDIR'] = os.path.join(     # 缺 → 中文歌词在 PDF 里渲染不出来
         os.environ.get('SystemRoot', r'C:\Windows'), 'Fonts')
-    if os.path.exists(pdf_path):
-        try:
-            os.remove(pdf_path)
-        except Exception:
-            pass
+    # ⚠ 一律转绝对路径：下面会切 cwd 进谱所在目录，相对路径会被解释到错位目录，
+    #   表现为「进程正常退出但产物不见」（实测踩坑）。
+    xml_abs = os.path.abspath(xml_path)
+    pdf_abs = os.path.abspath(pdf_path)
+    cands = [{}]                                   # ① 默认窗口平台
+    if _qt_platform_env(ms).get('QT_QPA_PLATFORM'):
+        cands.append({'QT_QPA_PLATFORM': 'offscreen'})   # ② 无桌面会话时兜底
 
-    proc = None
-    try:
-        proc = subprocess.Popen([ms, '-o', pdf_path, xml_path], env=env,
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                cwd=os.path.dirname(xml_path))
-    except Exception as e:
-        print(f"[排版] MuseScore 调用异常：{e}")
-        return False
-
-    deadline = time.time() + timeout
-    stable = 0
-    last = -1
-    try:
-        while time.time() < deadline:
-            time.sleep(1.0)
-            if os.path.isfile(pdf_path):
-                try:
-                    size = os.path.getsize(pdf_path)
-                except OSError:
-                    size = 0
-                if size > 0 and size == last:
-                    stable += 1
-                    if stable >= 2:           # 连续两次大小不变 → 写盘完成
-                        print(f"[排版] PDF 已产出（{size} 字节）")
-                        return True
-                else:
-                    stable = 0
-                last = size
-            if proc.poll() is not None:
-                # 进程已退出：给它 3 秒缓冲再看一次产物
-                time.sleep(3)
-                if os.path.isfile(pdf_path) and os.path.getsize(pdf_path) > 0:
-                    return True
-                break
-    finally:
-        if proc.poll() is None:
+    for idx, extra in enumerate(cands):
+        if os.path.exists(pdf_abs):
             try:
-                proc.kill()
+                os.remove(pdf_abs)
             except Exception:
                 pass
-    if not (os.path.isfile(pdf_path) and os.path.getsize(pdf_path) > 0):
-        print(f"[排版] MuseScore 未产出 PDF（超时 {timeout}s）——"
-              f"可能弹出了对话框等待点击，或首次运行正在初始化音源")
-        return False
-    return True
+        env = dict(env_base)
+        env.update(extra)
+        tag = 'offscreen' if extra else '默认平台'
+        proc = None
+        try:
+            proc = subprocess.Popen([ms, '-o', pdf_abs, xml_abs], env=env,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                    cwd=os.path.dirname(xml_abs))
+        except Exception as e:
+            print(f"[排版] MuseScore 调用异常（{tag}）：{e}")
+            continue
+
+        deadline = time.time() + timeout
+        stable, last = 0, -1
+        exit_early = False
+        try:
+            while time.time() < deadline:
+                time.sleep(0.5)
+                if os.path.isfile(pdf_abs):
+                    try:
+                        size = os.path.getsize(pdf_abs)
+                    except OSError:
+                        size = 0
+                    if size > 0 and size == last:
+                        stable += 1
+                        if stable >= 2:
+                            print(f"[排版] PDF 已产出（{size} 字节 · {tag}）")
+                            return True
+                    else:
+                        stable = 0
+                    last = size
+                if proc.poll() is not None:
+                    time.sleep(1.5)            # 给写盘留缓冲
+                    if os.path.isfile(pdf_abs) and os.path.getsize(pdf_abs) > 0:
+                        print(f"[排版] PDF 已产出（{tag}）")
+                        return True
+                    exit_early = True
+                    break
+        finally:
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        if exit_early:
+            print(f"[排版] {tag} 下 MuseScore 提前退出且无产物，换下一档…")
+            continue
+        print(f"[排版] {tag} 下超时 {timeout}s 未产出，换下一档…")
+
+    print("[排版] 全部平台均未产出 PDF —— 请确认 MuseScore 能正常打开该谱"
+          "（首次运行需初始化音源，耗时较长）")
+    return False
 
 
 def _pdf_cjk_count(pdf_path: str) -> int:
-    """PDF 文本层里的汉字数（0 = 字体没配好）。fitz 不可用时返回 -1（跳过该判据）。"""
-    try:
-        import fitz
-        d = fitz.open(pdf_path)
-        n = sum(1 for p in d for c in p.get_text() if '\u4e00' <= c <= '\u9fff')
-        d.close()
-        return n
-    except Exception:
-        return -1
+    """PDF 文本层里的汉字数（0 = 字体没配好）。fitz 不可用时返回 -1（跳过该判据）。
+
+    ⚠ 刚由 MuseScore 写出的 PDF 有短暂句柄占用，首读会抛异常 → 重试几次，
+    否则自检恒为 -1，中文渲染失败就成了漏网之鱼（实测踩坑）。
+    """
+    for attempt in range(4):
+        try:
+            import fitz
+            d = fitz.open(pdf_path)
+            n = sum(1 for p in d for c in p.get_text() if '\u4e00' <= c <= '\u9fff')
+            d.close()
+            return n
+        except ImportError:
+            return -1
+        except Exception:
+            time.sleep(0.6 * (attempt + 1))
+    return -1
 
 
 # ===================== 酷狗「钢琴谱」页面 SVG 反解 =====================
@@ -1504,7 +1841,11 @@ _PSV_ACC = {}
 PSV_KIND = {'maj': 'major', 'min': 'minor', 'maj7': 'major-seventh',
             'min7': 'minor-seventh', '7': 'dominant', '6': 'major-sixth',
             'm6': 'minor-sixth', 'dim': 'diminished', 'aug': 'augmented',
-            'sus4': 'suspended-fourth', 'sus2': 'suspended-second'}
+            'sus4': 'suspended-fourth', 'sus2': 'suspended-second',
+            # 弹唱谱 JSON 里还会出现这些（实测和弦池：min7 / maj7 / min / maj / 7 / sus4）
+            'm7b5': 'half-diminished', 'm7-5': 'half-diminished',
+            'dim7': 'diminished-seventh', 'maj9': 'major-ninth',
+            'm9': 'minor-ninth', '9': 'dominant-ninth', '5': 'power'}
 
 # 调名 -> fifths。⚠️ 有些曲目 original_tune 写作等音（如 Eb 写成 #D），
 # 一律认 songTone，别被 original_tune 带偏。
@@ -2620,28 +2961,37 @@ def _pulu_probe_versions(opern_id: str) -> tuple:
     return "", None
 
 
-def process_pulu(input_str: str, output_dir: str, custom: str = "") -> str:
-    """酷狗分享链接 → Medium 档「小提琴单行版（含歌词）」矢量 PDF。
+def process_pulu(input_str: str, output_dir: str, custom: str = "",
+                 sheet_kind: str = '') -> str:
+    """酷狗分享链接 → 指定谱种的矢量 PDF。
 
-    链路：网关签名取直链 → 下载 MusicXML → 清噪（花体踏板 + osmdScoreType）
-          → 裁第一个 part（旋律 + 歌词）→ MuseScore 无头排版 → PDF
+    谱种由 sheet_kind 决定（前端「设置 → 默认输出谱种」可选，未传则用全局默认）：
+      violin  小提琴单行（裁第一声部 + 歌词）—— 默认
+      piano   钢琴大谱表（双声部原样保留）
+      jianpu  简谱 / 级数功能谱（源自 _7_ 资源）
+      guitar / ukulele  和弦节奏谱（源自 _1_ 弹唱谱：和弦 + 逐字歌词 + 节奏斜线）
+    链路：按谱种定位 opern 资源 → 取 MusicXML（页面解密源优先）→ 清噪
+          → 按谱种裁 / 不裁声部 → MuseScore 无头排版 → PDF
     """
-    opern_id = _pulu_parse_opernid(input_str)
-    if not opern_id:
+    sheet_kind = (sheet_kind or PULU_WANT_SHEET).strip()
+    cfg = _pulu_sheet_kind(sheet_kind)
+    print(f"[pulu] 目标谱种：{cfg['label']}（{sheet_kind}）")
+
+    if cfg['mode'] == 'chord':
+        return _pulu_chord_path(input_str, output_dir, custom=custom, kind=sheet_kind)
+
+    if not _pulu_parse_opernid(input_str):
         raise ValueError("未在链接中找到 opernid（酷狗曲谱分享链接形如 …/xml.html?opernid=<ID>_<N>_<N>）")
-    instruments = opern_id.split('_')[1] if opern_id.count('_') >= 2 else '1'
-    print(f"[pulu] opernid = {opern_id}（instruments={instruments}）")
 
     try:
-        js = _pulu_fetch(opern_id, instruments)
+        opern_id, js, data, info = _pulu_resolve_opern(input_str, sheet_kind)
+    except ValueError:
+        raise
     except Exception as e:
         raise ValueError(f"酷狗网关请求失败：{e}")
-    if js.get('errcode') not in (0, '0', None):
-        raise ValueError(f"酷狗网关返回错误：errcode={js.get('errcode')} errmsg={js.get('errmsg')!r}")
-
-    data = js.get('data') or {}
-    info = data.get('opern_info') or {}
     levels = info.get('opern_level_file') or {}
+    print(f"[pulu] opernid = {opern_id}（{info.get('opern_name') or '-'} · "
+          f"{info.get('opern_draw_type_name') or '-'}）")
 
     if not levels:
         # 三类可能，逐一甄别（切勿一律报「已下架」——那是误诊）
@@ -2693,10 +3043,18 @@ def process_pulu(input_str: str, output_dir: str, custom: str = "") -> str:
         # 接口字段名没变，内容却不再可解析 → 退到「页面所见即所得」通道。
         if raw_bytes[:4] == b'KQPU':
             print("[pulu] 直链为加密格式（KQPU）→ 改从页面读取解密后的原始 MusicXML")
-            _url = re.sub(r'(?<=[?&])sheetType=\d+', 'sheetType=3',
-                          extract_url(input_str))
+            # sheetType 决定页面渲染哪种谱面视图：3=五线谱（钢琴/独奏）4=简谱（级数）
+            want_st = '4' if cfg['mode'] == 'staff' and sheet_kind == 'jianpu' else '3'
+            _url = extract_url(input_str)
+            # ⚠ opernid 必须同步换成**本次实际使用的资源**：跨谱种时（如贴简谱链接却要
+            #   钢琴谱）沿用原链接的 opernid，页面仍会加载旧资源，取回的还是原谱种数据。
+            if 'opernid=' in _url:
+                _url = re.sub(r'(?<=[?&])opernid=[^&]+', f'opernid={opern_id}', _url)
+            else:
+                _url += ('&' if '?' in _url else '?') + f'opernid={opern_id}'
+            _url = re.sub(r'(?<=[?&])sheetType=\d+', f'sheetType={want_st}', _url)
             if 'sheetType=' not in _url:
-                _url += ('&' if '?' in _url else '?') + 'sheetType=3'
+                _url += ('&' if '?' in _url else '?') + f'sheetType={want_st}'
             raw = _pulu_page_musicxml(_url)
             if not raw:
                 print("[pulu] 页面未给出原始谱面数据 → 降级为自适应反解")
@@ -2711,9 +3069,14 @@ def process_pulu(input_str: str, output_dir: str, custom: str = "") -> str:
         x, n_osmd = _pulu_strip_osmd(raw)      # 必须在写盘前删：交付件要能被 MuseScore 直接打开
         x, n_pedal = _pulu_strip_pedal(x)
         x = _pulu_set_title(x, custom or song)
-        x, n_drop = _pulu_keep_first_part(x)
-        if n_drop == 0:
-            print("[pulu] 提示：该谱只有一个声部，已原样保留（无伴奏可裁）")
+        if sheet_kind == 'violin':
+            x, n_drop = _pulu_keep_first_part(x)
+            if n_drop == 0:
+                print("[pulu] 提示：该谱只有一个声部，已原样保留（无伴奏可裁）")
+        else:
+            n_drop = 0
+            n_parts = len(re.findall(r'<score-part id=', x))
+            print(f"[pulu] 谱种「{cfg['label']}」→ 保留全部 {n_parts} 个声部（不裁）")
 
         xml_tmp = os.path.join(tmpdir, "score.musicxml")
         with open(xml_tmp, 'w', encoding='utf-8', newline='') as f:
@@ -2721,7 +3084,7 @@ def process_pulu(input_str: str, output_dir: str, custom: str = "") -> str:
 
         stem = f"{song}-{singer}" if singer else song
         os.makedirs(output_dir, exist_ok=True)
-        out = os.path.join(output_dir, safe_name(f"{stem}-小提琴") + ".pdf")
+        out = os.path.join(output_dir, safe_name(f"{stem}-{cfg['suffix']}") + ".pdf")
         if not mxl2pdf(ms, xml_tmp, out):
             raise ValueError(
                 "MuseScore 排版失败（未产出 PDF）。\n"
@@ -2740,7 +3103,7 @@ def process_pulu(input_str: str, output_dir: str, custom: str = "") -> str:
             print("[pulu] ⚠ 未提取到歌词（酷狗侧该谱可能本就没有对轴歌词）")
         if cn == 0:
             raise ValueError("自检未通过：PDF 中未检出任何中文（中文字体渲染失败）")
-        print(f"✅ PDF 已生成：{out}（{os.path.getsize(out)} 字节 · 酷狗 {level} 小提琴单行版）")
+        print(f"✅ PDF 已生成：{out}（{os.path.getsize(out)} 字节 · 酷狗 {level} · {cfg['label']}）")
         return out
     finally:
         try:
@@ -3799,6 +4162,8 @@ def main():
     ap.add_argument("--name", default="", help="自定义文件名（不含扩展名）")
     ap.add_argument("--cookie", default="", help="网站 Cookie（词曲网 ktvc8 云锁会话，可选）")
     ap.add_argument("--captcha", default="", help="词曲网 WAF 验证码手动答案（前端弹窗输入，可选）")
+    ap.add_argument("--sheet-kind", default="",
+                    help="酷狗曲谱输出谱种：violin(默认) / piano / jianpu / guitar / ukulele")
     ap.add_argument("--selftest", action="store_true", help="运行冒烟测试")
     ap.add_argument("--env-doctor", action="store_true",
                     help="环境体检：输出 JSON（供前端引导面板使用）")
@@ -3810,6 +4175,12 @@ def main():
 
     if args.cookie:
         os.environ["SCORE_KTVC8_COOKIE"] = args.cookie
+    if args.sheet_kind:
+        global PULU_WANT_SHEET
+        if args.sheet_kind not in PULU_SHEET_KINDS:
+            print(f"[pulu] ⚠ 未知谱种 {args.sheet_kind!r}，回落默认 {PULU_WANT_SHEET}")
+        else:
+            PULU_WANT_SHEET = args.sheet_kind
     if args.env_doctor:
         print(json.dumps(env_doctor(), ensure_ascii=False))
         return

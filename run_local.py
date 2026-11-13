@@ -181,6 +181,9 @@ class Handler(BaseHTTPRequestHandler):
         out = payload.get("output_dir", r"G:\Lin_File\Documents\曲谱")
         theme = payload.get("theme", "")
         name = payload.get("name", "")
+        kind = payload.get("sheetKind", "")
+        if kind and kind in sp.PULU_SHEET_KINDS:
+            sp.PULU_WANT_SHEET = kind      # 前端设置 → 酷狗曲谱输出谱种
 
         buf = io.StringIO()
         old = sys.stdout

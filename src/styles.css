@@ -307,6 +307,26 @@ body.tauri .win, body.appmode .win {
 .toggle { width: 40px; height: 22px; border-radius: 999px; background: rgba(201,169,97,0.6); position: relative; cursor: pointer; }
 .toggle::after { content: ""; position: absolute; right: 3px; top: 3px; width: 16px; height: 16px; border-radius: 50%; background: #20180a; }
 
+/* 谱种选择器 */
+.kind-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 9px; }
+@media (max-width: 760px) { .kind-grid { grid-template-columns: repeat(2, 1fr); } }
+.kind-opt {
+  display: flex; flex-direction: column; gap: 4px; padding: 11px 10px; border-radius: 8px;
+  border: 1px solid var(--line); background: rgba(255,255,255,0.015); cursor: pointer;
+  transition: border-color .15s, background .15s;
+}
+.kind-opt:hover { border-color: rgba(201,169,97,0.45); }
+.kind-opt.on { border-color: var(--gold); background: rgba(201,169,97,0.10); }
+.kind-opt input { position: absolute; opacity: 0; pointer-events: none; }
+.ko-name { font-family: var(--serif); font-size: 12.5px; line-height: 1.3; color: var(--ivory); }
+.kind-opt.on .ko-name { color: var(--gold-2, var(--gold)); }
+.ko-desc { font-size: 10.5px; color: var(--muted); line-height: 1.5; }
+.kind-note {
+  margin-top: 12px; font-size: 11px; color: var(--muted); line-height: 1.7;
+  padding-top: 11px; border-top: 1px solid var(--line);
+}
+.kind-note b { color: var(--ivory); font-weight: 400; }
+
 .statusbar {
   height: 34px; flex-shrink: 0; display: flex; align-items: center; justify-content: space-between;
   padding: 0 20px; background: var(--ink-2); color: var(--muted); font-size: 11px;

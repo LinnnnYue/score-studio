@@ -26,7 +26,7 @@
       <div class="nav-item" data-view="library"><span class="ic">♪</span> 曲库</div>
       <div class="nav-item" data-view="inspect"><span class="ic">❖</span> 巡检</div>
       <div class="nav-item" data-view="settings"><span class="ic">⚙</span> 设置</div>
-      <div class="foot">古典 · 巴洛克<br/>主题外壳 v0.2.9<br/><span style="color:var(--gold)">锚点：无边框高级感</span></div>
+      <div class="foot">古典 · 巴洛克<br/>主题外壳 v0.3.11<br/><span style="color:var(--gold)">锚点：无边框高级感</span></div>
     </div>
 
     <!-- 主区 -->
@@ -47,6 +47,7 @@
         <div class="hero-h">将散落的曲谱，皈依为统一形制</div>
         <div class="hero-p">粘贴微信公众号 / 弹琴吧 / 人人文档 / 抖音图文链接，或拖入本地图片与 PDF。<b>提取 → 透明转白底 → LANCZOS 缩放至 2009px → 300DPI·95 PDF</b>，输出至你指定的目录。</div>
         <div class="naming-rule">命名规则：<b>曲名 - 歌手 - 专辑</b>（专辑可选，无则省略）</div>
+        <div class="naming-rule">酷狗曲谱输出谱种：<b id="kindHint">小提琴单行</b>　<span style="color:var(--muted)">（在「设置」中切换）</span></div>
 
         <div class="field-label">SOURCE · 来源链接</div>
         <div class="input-row">
@@ -152,6 +153,24 @@
             <h4>命名与题注</h4>
             <div class="row"><span class="k">文件名规则</span><span class="v" style="font-family:var(--sans);font-size:11px;">曲名-歌手-专辑</span></div>
             <div class="row"><span class="k">外壳主题</span><span class="v">巴洛克</span></div>
+          </div>
+          <div class="set" style="grid-column: 1 / -1;">
+            <h4>默认输出谱种
+              <span style="font-weight:400;font-size:11px;color:var(--muted);">（酷狗曲谱链接适用 · 选定后贴任意酷狗曲谱链接都按它出谱）</span>
+            </h4>
+            <div class="kind-grid" id="kindGrid">
+              <label class="kind-opt"><input type="radio" name="sheetKind" value="violin" />
+                <span class="ko-name">小提琴单行</span><span class="ko-desc">旋律 + 歌词 · 单谱表</span></label>
+              <label class="kind-opt"><input type="radio" name="sheetKind" value="piano" />
+                <span class="ko-name">钢琴大谱表</span><span class="ko-desc">右手 + 左手 · 双谱表</span></label>
+              <label class="kind-opt"><input type="radio" name="sheetKind" value="jianpu" />
+                <span class="ko-name">简谱功能谱</span><span class="ko-desc">级数和声 · 五线谱形式</span></label>
+              <label class="kind-opt"><input type="radio" name="sheetKind" value="guitar" />
+                <span class="ko-name">吉他和弦谱</span><span class="ko-desc">和弦 + 歌词 + 节奏斜线</span></label>
+              <label class="kind-opt"><input type="radio" name="sheetKind" value="ukulele" />
+                <span class="ko-name">尤克里里和弦谱</span><span class="ko-desc">与吉他同源和弦数据</span></label>
+            </div>
+            <div class="kind-note" id="kindNote"></div>
           </div>
           <div class="set" style="grid-column: 1 / -1;">
             <h4>网站会话 Cookie <span style="font-weight:400;font-size:11px;color:var(--muted);">（可选 · 词曲网 ktvc8 被云锁拦截时填）</span></h4>

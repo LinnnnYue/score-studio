@@ -52,6 +52,53 @@ if (cookieInput) {
 
 let themeOn = true;
 
+// ============ 默认输出谱种（酷狗曲谱链接适用） ============
+// 一个 opern 只承载一种谱面，故「要什么谱」= 「要哪个资源」。
+// 软件侧按选定谱种自动定位对应资源，用户贴任意酷狗曲谱链接都能出想要的谱。
+const KIND_KEY = 'scorestudio.sheetkind';
+const KIND_META = {
+  violin:  { name: '小提琴单行', note: '取<b>五线谱（AI独奏谱）</b>资源，裁掉伴奏声部只留旋律 + 歌词。最适合小提琴、笛子等单声部乐器跟奏。' },
+  piano:   { name: '钢琴大谱表', note: '取<b>五线谱（AI独奏谱）</b>资源，保留右手 + 左手双谱表。这是酷狗侧质量最高的一档：调号、升降号、和弦、歌词、段落标记全部完整。' },
+  jianpu:  { name: '简谱功能谱', note: '取<b>级数谱（AI功能谱）</b>资源。需说明：酷狗前端把它画成简谱，但数据层仍是五线谱 —— 本软件导出的是<b>五线谱形式的和声功能谱</b>（左手柱式和弦），不是数字 1234567。若要真·数字简谱，需另行渲染，可再议。' },
+  guitar:  { name: '吉他和弦谱', note: '取<b>弹唱谱</b>资源，排成标准 lead sheet：和弦记号 + 逐字歌词 + 节奏斜线。酷狗该谱源<b>没有六线谱指法</b>（无弦号/品格号，页面上的六线谱是前端按和弦名推演的），故不伪造 TAB。' },
+  ukulele: { name: '尤克里里和弦谱', note: '与吉他<b>同源</b>（酷狗侧没有独立的尤克里里资源，四线谱只是把同一份和弦数据换个画法），输出内容与吉他档一致，仅文件名区分。' },
+};
+const KIND_ORDER = ['violin', 'piano', 'jianpu', 'guitar', 'ukulele'];
+function getSheetKind() {
+  let k = '';
+  try { k = localStorage.getItem(KIND_KEY) || ''; } catch (_) {}
+  return KIND_ORDER.includes(k) ? k : 'violin';
+}
+function syncKindUI() {
+  const cur = getSheetKind();
+  const grid = $('kindGrid');
+  if (grid) {
+    grid.querySelectorAll('.kind-opt').forEach((el) => {
+      const inp = el.querySelector('input');
+      const on = !!inp && inp.value === cur;
+      if (inp) inp.checked = on;
+      el.classList.toggle('on', on);
+    });
+  }
+  const note = $('kindNote');
+  if (note) note.innerHTML = (KIND_META[cur] || {}).note || '';
+  const hint = $('kindHint');
+  if (hint) hint.textContent = (KIND_META[cur] || {}).name || '小提琴单行';
+}
+(function initKindPicker() {
+  const grid = $('kindGrid');
+  if (!grid) return;
+  grid.addEventListener('click', (e) => {
+    const opt = e.target.closest('.kind-opt');
+    if (!opt) return;
+    const inp = opt.querySelector('input');
+    if (!inp) return;
+    try { localStorage.setItem(KIND_KEY, inp.value); } catch (_) {}
+    syncKindUI();
+  });
+  syncKindUI();
+})();
+
 // ============ 视图切换 ============
 document.querySelectorAll('.nav-item').forEach((n) => {
   n.addEventListener('click', () => {
@@ -957,6 +1004,7 @@ $('runBtn').onclick = async () => {
         name: customName,
         cookie: cookieInput ? cookieInput.value.trim() : '',
         captcha: '',
+        sheetKind: getSheetKind(),
       });
       if (res && res.ok) {
         st.textContent = '已完成'; st.classList.add('done'); st.classList.remove('err');
@@ -981,6 +1029,7 @@ $('runBtn').onclick = async () => {
               name: customName,
               cookie: cookieInput ? cookieInput.value.trim() : '',
               captcha: ans,
+              sheetKind: getSheetKind(),
             });
             if (res && res.ok) {
               st.textContent = '已完成'; st.classList.add('done'); st.classList.remove('err');

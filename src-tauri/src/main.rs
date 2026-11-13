@@ -418,10 +418,11 @@ async fn process_scores(
     name: String,
     cookie: Option<String>,
     captcha: Option<String>,
+    sheet_kind: Option<String>,
 ) -> ProcessResult {
     fn process_scores_inner(app: tauri::AppHandle, input: String, output_dir: String,
                                    theme: String, name: String, cookie: Option<String>,
-                                   captcha: Option<String>) -> ProcessResult {
+                                   captcha: Option<String>, sheet_kind: Option<String>) -> ProcessResult {
         let python = resolve_python(&app);
         let script = resolve_pipeline(&app);
 
@@ -452,6 +453,11 @@ async fn process_scores(
         }
         if !name.is_empty() {
             cmd.arg("--name").arg(&name);
+        }
+        if let Some(sk) = sheet_kind {
+            if !sk.trim().is_empty() {
+                cmd.arg("--sheet-kind").arg(sk.trim());
+            }
         }
 
         // spawn 子进程：stdout 逐行扫描，发现验证码标记 → emit 事件给前端 → 前端弹窗
@@ -545,7 +551,7 @@ async fn process_scores(
         }
     }
 
-    tauri::async_runtime::spawn_blocking(move || process_scores_inner(app, input, output_dir, theme, name, cookie, captcha))
+    tauri::async_runtime::spawn_blocking(move || process_scores_inner(app, input, output_dir, theme, name, cookie, captcha, sheet_kind))
     .await
     .unwrap_or(ProcessResult {
         ok: false,
